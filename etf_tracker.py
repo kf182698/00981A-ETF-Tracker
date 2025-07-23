@@ -23,8 +23,10 @@ headers = {
 resp = requests.get(BASE_URL, params={"fundCode": FUND_CODE}, headers=headers, verify=False)
 
 # 檢查是否成功下載 Excel
+print("EZMoney 回傳 Content-Type：", resp.headers.get("Content-Type", "無"))
 if not resp.headers.get("Content-Type", "").startswith("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"):
     raise Exception("下載失敗，EZMoney 可能封鎖請求或回傳非 Excel 格式。")
+
 
 # 儲存 XLSX 並轉成 CSV
 xlsx_path = f"data/{TODAY}.xlsx"
