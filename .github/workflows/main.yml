@@ -2,23 +2,26 @@ name: Daily ETF Tracker (Selenium)
 
 on:
   schedule:
-    - cron: '0 12 * * *'   # 台北時間每日 20:00
+    - cron: '0 12 * * *'   # 台北時間 20:00
   workflow_dispatch:
+
+permissions:
+  contents: write   # 👈 允許這個工作流程 push
 
 jobs:
   run-tracker:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}   # 👈 明確使用內建 token（可省，但寫上較清楚）
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      # 用官方 action 安裝 Chrome（避免自己 apt 安裝踩雷）
       - name: Install Chrome
         uses: browser-actions/setup-chrome@v1
         with:
@@ -36,9 +39,19 @@ jobs:
         run: python compare_holdings.py
 
       - name: Commit results
+        shell: bash
         run: |
-          git config user.name github-actions
-          git config user.email github-actions@github.com
-          git add data/*.csv diff/*.csv || true
-          git commit -m "Daily update: $(date '+%Y-%m-%d')" || echo "No changes"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # 安全地加入檔案：不存在的路徑不會中斷
+          git add -A
+
+          # 若沒有變更就不送 commit / push
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Daily update: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
           git push
