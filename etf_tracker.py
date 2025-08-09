@@ -153,42 +153,77 @@ try:
         driver.get(href_fallback)
         time.sleep(2)
 
-    # 4) 等待 Excel 下載完成（觀察 .crdownload 與 .xlsx）
-    timeout = time.time() + 120  # 最長等 120 秒
-    xlsx_path = None
-    last_seen_status = ""
+    # 4) 等待 Excel 下載完成（先等開始 → 再等大小穩定）
+def list_crdownload():
+    try:
+        return [n for n in os.listdir(DOWNLOAD_DIR) if n.endswith(".crdownload")]
+    except FileNotFoundError:
+        return []
 
-    while time.time() < timeout:
-        crd = [n for n in os.listdir(DOWNLOAD_DIR) if n.endswith(".crdownload")]
-        xlsx = latest_xlsx()
-        status = f"crdownload={len(crd)}, xlsx={'yes' if xlsx else 'no'}"
-        if status != last_seen_status:
-            log(f"Downloading… ({status})")
-            last_seen_status = status
+def latest_xlsx_path():
+    files = sorted(glob.glob(os.path.join(DOWNLOAD_DIR, "*.xlsx")), key=os.path.getmtime)
+    return files[-1] if files else None
 
-        if crd:
-            time.sleep(1)
-            continue
+def size_stable(path, checks=5, interval=1.0):
+    """檔案大小連續 checks 次未變化即視為穩定"""
+    if not path or not os.path.exists(path):
+        return False
+    last = -1
+    stable = 0
+    for _ in range(checks):
+        sz = os.path.getsize(path)
+        if sz == last and sz > 0:
+            stable += 1
+        else:
+            stable = 0
+        last = sz
+        time.sleep(interval)
+    return stable >= (checks - 1)
 
-        if xlsx:
-            xlsx_path = xlsx
-            break
+# 先等「下載啟動」
+start_deadline = time.time() + 60  # 最多等 60 秒開始
+while time.time() < start_deadline:
+    crd = list_crdownload()
+    xlsx = latest_xlsx_path()
+    log(f"Downloading… (crdownload={len(crd)}, xlsx={'yes' if xlsx else 'no'})")
+    if crd or xlsx:
+        break
+    time.sleep(1)
 
+# 再等「完成或大小穩定」
+xlsx_path = None
+finish_deadline = time.time() + 180  # 最多再等 180 秒完成
+while time.time() < finish_deadline:
+    crd = list_crdownload()
+    xlsx = latest_xlsx_path()
+
+    status = f"crdownload={len(crd)}, xlsx={'yes' if xlsx else 'no'}"
+    log(f"Downloading… ({status})")
+
+    # 有 xlsx 檔，且大小穩定，就視為完成
+    if xlsx and size_stable(xlsx, checks=6, interval=0.8):
+        xlsx_path = xlsx
+        break
+
+    # 沒有 crdownload，但也找不到 xlsx → 再等一下（有些瀏覽器重命名稍有延遲）
+    if not crd and not xlsx:
         time.sleep(1)
+        continue
 
-    if not xlsx_path and href_fallback:
-        # 最後一搏：再嘗試一次導向
-        log("Retry direct navigation to export href once more…")
-        driver.get(href_fallback)
-        time.sleep(3)
-        xlsx = latest_xlsx()
-        if xlsx:
-            xlsx_path = xlsx
+    time.sleep(1)
 
-    if not xlsx_path:
-        raise RuntimeError("未偵測到下載完成的 .xlsx 檔（可能被網站阻擋或按鈕定位失敗）。")
+# 最後保險一次：若仍未成功，但有 xlsx 且檔案 > 0，就放行
+if not xlsx_path:
+    x = latest_xlsx_path()
+    if x and os.path.getsize(x) > 0:
+        log("No perfect finish detected, but XLSX exists with size > 0. Proceeding.")
+        xlsx_path = x
 
-    log(f"Downloaded Excel: {os.path.basename(xlsx_path)}")
+if not xlsx_path:
+    raise RuntimeError("未偵測到下載完成的 .xlsx 檔（可能被網站阻擋或按鈕定位失敗）。")
+
+log(f"Downloaded Excel: {os.path.basename(xlsx_path)}")
+
 
     # 5) 解析 Excel：自動定位正確工作表與表頭
     xls = pd.ExcelFile(xlsx_path, engine="openpyxl")
