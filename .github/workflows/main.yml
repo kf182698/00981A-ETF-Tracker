@@ -6,16 +6,15 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write   # 👈 允許這個工作流程 push
+  contents: write
 
 jobs:
   run-tracker:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}   # 👈 明確使用內建 token（可省，但寫上較清楚）
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -38,20 +37,22 @@ jobs:
       - name: Compare with yesterday
         run: python compare_holdings.py
 
+      - name: Send email
+        env:
+          EMAIL_USERNAME: ${{ secrets.EMAIL_USERNAME }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: python send_email.py
+
       - name: Commit results
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          # 安全地加入檔案：不存在的路徑不會中斷
           git add -A
-
-          # 若沒有變更就不送 commit / push
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
           fi
-
           git commit -m "Daily update: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
           git push
