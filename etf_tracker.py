@@ -101,46 +101,70 @@ try:
     if not xlsx_path:
         raise RuntimeError("未偵測到下載完成的 .xlsx 檔。")
 
-    # 讀 Excel → 取四欄 → 存 CSV
-    df = pd.read_excel(xlsx_path)
+    import pandas as pd
 
-    # 欄位正規化（清掉全形/半形空白）
-    df.columns = [str(c).strip().replace("　", "").replace("\u3000", "") for c in df.columns]
+def _normalize_cols(cols):
+    return [str(c).strip().replace("　", "").replace("\u3000", "") for c in cols]
 
-    # 欄位名稱容錯對映
-    alias = {
-        "股票代號": ["股票代號", "證券代號", "代號"],
-        "股票名稱": ["股票名稱", "證券名稱", "名稱"],
-        "股數":     ["股數", "持股股數"],
-        "持股權重": ["持股權重", "持股比例", "權重", "比重(%)", "占比(%)"]
-    }
-    def pick(colname):
-        for cand in alias[colname]:
-            if cand in df.columns:
-                return cand
-        raise KeyError(f"找不到欄位：{colname}，實際欄位={list(df.columns)}")
+alias = {
+    "股票代號": ["股票代號", "證券代號", "代號", "證券代號/代碼"],
+    "股票名稱": ["股票名稱", "證券名稱", "名稱"],
+    "股數":     ["股數", "持股股數", "持有股數"],
+    "持股權重": ["持股權重", "持股比例", "權重", "比重(%)", "占比(%)", "占比"]
+}
 
-    c_code = pick("股票代號")
-    c_name = pick("股票名稱")
-    c_shares = pick("股數")
-    c_weight = pick("持股權重")
+def _pick(df, key):
+    for cand in alias[key]:
+        if cand in df.columns:
+            return cand
+    return None
 
-    out = df[[c_code, c_name, c_shares, c_weight]].copy()
+# 逐張工作表嘗試、並嘗試不同表頭列
+xls = pd.ExcelFile(xlsx_path, engine="openpyxl")
+target_df = None
 
-    # 數值清洗（去逗號、% → 轉數字）
-    for col in [c_shares, c_weight]:
-        out[col] = (
-            out[col]
-            .astype(str)
-            .str.replace(",", "", regex=False)
-            .str.replace("%", "", regex=False)
-        )
-        out[col] = pd.to_numeric(out[col], errors="coerce")
+for sheet in xls.sheet_names:
+    # 先讀成無表頭，掃前 20 列找包含「股票代號/名稱」的那一列當 header
+    raw = pd.read_excel(xls, sheet_name=sheet, header=None, dtype=str)
+    found_header_row = None
+    for r in range(min(20, len(raw))):
+        row_vals = _normalize_cols(list(raw.iloc[r].fillna("").astype(str)))
+        if any(any(k in cell for k in alias["股票代號"]) for cell in row_vals) and \
+           any(any(k in cell for k in alias["股票名稱"]) for cell in row_vals):
+            found_header_row = r
+            break
+    if found_header_row is None:
+        # 直接跳過這張（很可能是封面/說明）
+        continue
 
-    out.columns = ["股票代號", "股票名稱", "股數", "持股權重"]
+    df_try = pd.read_excel(xls, sheet_name=sheet, header=found_header_row)
+    df_try.columns = _normalize_cols(df_try.columns)
 
-    csv_path = os.path.join(DATA_DIR, f"{TODAY}.csv")
-    out.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    c_code = _pick(df_try, "股票代號")
+    c_name = _pick(df_try, "股票名稱")
+    c_shares = _pick(df_try, "股數")
+    c_weight = _pick(df_try, "持股權重")
+
+    if all([c_code, c_name, c_shares, c_weight]):
+        target_df = df_try[[c_code, c_name, c_shares, c_weight]].copy()
+        target_df.columns = ["股票代號", "股票名稱", "股數", "持股權重"]
+        break
+
+if target_df is None:
+    raise KeyError(f"在任何工作表都找不到必要欄位，請手動下載檔案檢查欄名。工作表={xls.sheet_names}")
+
+# 數值清洗
+for col in ["股數", "持股權重"]:
+    target_df[col] = (
+        target_df[col].astype(str)
+        .str.replace(",", "", regex=False)
+        .str.replace("%", "", regex=False)
+    )
+    target_df[col] = pd.to_numeric(target_df[col], errors="coerce")
+
+csv_path = os.path.join(DATA_DIR, f"{TODAY}.csv")
+target_df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+
 
 finally:
     driver.quit()
