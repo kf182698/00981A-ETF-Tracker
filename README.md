@@ -1,23 +1,14 @@
-# 00981A ETF Tracker
+# 00981A ETF Tracker (Selenium)
 
-本專案每天自動從 EZMoney 下載 ETF「00981A」的最新投資組合（成分股），比對昨日與今日差異，並輸出報表。
+每天台北時間 20:00 自動打開 EZMoney 00981A 頁面，點擊「匯出XLSX」，轉為 CSV 並與昨日比對，輸出差異報表。
 
-## 功能
+### 重要檔案
+- `etf_tracker.py`：下載並整理資料（股票代號、股票名稱、股數、持股權重）
+- `compare_holdings.py`：與昨日檔案比對，輸出 `diff/diff_YYYY-MM-DD.csv`
+- `.github/workflows/main.yml`：GitHub Actions 排程
 
-- 自動下載 EZMoney 投資組合（XLSX 檔）
-- 擷取欄位：股票代號、名稱、股數、持股權重
-- 每日自動比對差異（股數、權重增減或異動）
-- 自動存檔至 GitHub repo
-
-## 使用方式
-
-1. Fork 本專案
-2. 進入 Settings → Secrets → Actions 新增：
-
-- `EMAIL_USERNAME`: 你的 Gmail 帳號
-- `EMAIL_PASSWORD`: 應用程式密碼
-
-## 執行結果
-
-- 每日資料儲存於 `/data/` 資料夾
-- 差異分析輸出於 `/diff/`
+### 手動測試
+Repo → **Actions** → `Daily ETF Tracker (Selenium)` → **Run workflow**  
+成功後檢查：
+- `data/YYYY-MM-DD.csv`
+- 若上一天已有檔，會有 `diff/diff_YYYY-MM-DD.csv`
