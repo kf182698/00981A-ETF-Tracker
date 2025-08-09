@@ -3,6 +3,7 @@ import time
 import glob
 import pandas as pd
 from datetime import datetime
+
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
@@ -10,18 +11,44 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import chromedriver_autoinstaller
 
-# === 基本設定 ===
+
+# ========= 基本設定 =========
 TODAY = datetime.today().strftime('%Y-%m-%d')
-# 這個 fundCode=49YTW 為你提供的頁面（EZMoney 對應到 00981A 的明細頁）
+# 這個 fundCode=49YTW 對應你提供的 EZMoney 頁面（00981A）
 URL = "https://www.ezmoney.com.tw/ETF/Fund/Info?fundCode=49YTW"
 
-# 下載與輸出目錄（使用絕對路徑較穩）
 DOWNLOAD_DIR = os.path.abspath("downloads")
 DATA_DIR = os.path.abspath("data")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# === 啟動 Chrome (Headless) ===
+
+def log(msg: str):
+    print(f"[etf_tracker] {msg}", flush=True)
+
+
+# ========= 欄位工具 =========
+def _normalize_cols(cols):
+    # 去除全形/半形空白
+    return [str(c).strip().replace("　", "").replace("\u3000", "") for c in cols]
+
+
+ALIAS = {
+    "股票代號": ["股票代號", "證券代號", "代號", "證券代號/代碼"],
+    "股票名稱": ["股票名稱", "證券名稱", "名稱"],
+    "股數":     ["股數", "持股股數", "持有股數"],
+    "持股權重": ["持股權重", "持股比例", "權重", "比重(%)", "占比(%)", "占比"]
+}
+
+
+def _pick(df: pd.DataFrame, key: str):
+    for cand in ALIAS[key]:
+        if cand in df.columns:
+            return cand
+    return None
+
+
+# ========= 啟動 Chrome (Headless) =========
 chromedriver_autoinstaller.install()
 options = Options()
 options.add_argument("--headless=new")          # 新版 headless
@@ -42,35 +69,42 @@ options.add_experimental_option("prefs", {
 driver = webdriver.Chrome(options=options)
 driver.set_window_size(1280, 900)
 
-def log(msg: str):
-    print(f"[etf_tracker] {msg}", flush=True)
+# 顯式允許 headless 下載（CDP）
+try:
+    driver.execute_cdp_cmd("Page.setDownloadBehavior", {
+        "behavior": "allow",
+        "downloadPath": DOWNLOAD_DIR
+    })
+except Exception:
+    try:
+        driver.execute_cdp_cmd("Browser.setDownloadBehavior", {
+            "behavior": "allow",
+            "downloadPath": DOWNLOAD_DIR
+        })
+    except Exception:
+        pass
 
-# === 欄位工具 ===
-def _normalize_cols(cols):
-    # 去除全形/半形空白
-    return [str(c).strip().replace("　", "").replace("\u3000", "") for c in cols]
 
-ALIAS = {
-    "股票代號": ["股票代號", "證券代號", "代號", "證券代號/代碼"],
-    "股票名稱": ["股票名稱", "證券名稱", "名稱"],
-    "股數":     ["股數", "持股股數", "持有股數"],
-    "持股權重": ["持股權重", "持股比例", "權重", "比重(%)", "占比(%)", "占比"]
-}
+def has_active_downloads() -> bool:
+    try:
+        return any(name.endswith(".crdownload") for name in os.listdir(DOWNLOAD_DIR))
+    except FileNotFoundError:
+        return False
 
-def _pick(df: pd.DataFrame, key: str):
-    for cand in ALIAS[key]:
-        if cand in df.columns:
-            return cand
-    return None
+
+def latest_xlsx():
+    files = sorted(glob.glob(os.path.join(DOWNLOAD_DIR, "*.xlsx")), key=os.path.getmtime)
+    return files[-1] if files else None
+
 
 try:
-    # === 1) 開頁 ===
+    # 1) 開頁
     log(f"Open page: {URL}")
     driver.get(URL)
-    WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+    WebDriverWait(driver, 25).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
     time.sleep(1)
 
-    # === 2) 嘗試點「基金投資組合」分頁（若有）===
+    # 2) 嘗試點「基金投資組合」分頁（若有）
     for locator in [
         (By.XPATH, "//*[contains(text(),'基金投資組合')]"),
         (By.XPATH, "//*[contains(text(),'投資組合')]"),
@@ -79,12 +113,12 @@ try:
             el = WebDriverWait(driver, 5).until(EC.element_to_be_clickable(locator))
             driver.execute_script("arguments[0].click();", el)
             log("Clicked tab: 基金投資組合")
-            time.sleep(1)
+            time.sleep(0.8)
             break
         except Exception:
             pass
 
-    # === 3) 找「匯出XLSX」按鈕並點擊 ===
+    # 3) 找「匯出XLSX」按鈕並嘗試下載
     export_locators = [
         (By.XPATH, "//a[contains(., 'XLSX')]"),
         (By.XPATH, "//a[contains(., '匯出')]"),
@@ -92,10 +126,15 @@ try:
         (By.CSS_SELECTOR, "a[href*='Export'][href*='xlsx'], a[href*='XLSX']")
     ]
     clicked = False
+    href_fallback = None
+
     for loc in export_locators:
         try:
-            btn = WebDriverWait(driver, 10).until(EC.element_to_be_clickable(loc))
-            driver.execute_script("arguments[0].click();", btn)  # 用 JS click 較穩
+            btn = WebDriverWait(driver, 12).until(EC.element_to_be_clickable(loc))
+            href_fallback = btn.get_attribute("href")
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+            time.sleep(0.3)
+            driver.execute_script("arguments[0].click();", btn)  # JS click 較穩
             clicked = True
             log("Clicked: 匯出XLSX")
             break
@@ -105,35 +144,58 @@ try:
     if not clicked:
         raise RuntimeError("找不到『匯出XLSX』按鈕，請檢查頁面是否改版或權限限制。")
 
-    # === 4) 等待 Excel 下載完成 ===
-    def latest_xlsx():
-        files = sorted(glob.glob(os.path.join(DOWNLOAD_DIR, "*.xlsx")), key=os.path.getmtime)
-        return files[-1] if files else None
+    # 給點時間讓下載開始
+    time.sleep(2)
 
+    # 若無下載活動也無檔案 → 嘗試以 href 直接導向
+    if not has_active_downloads() and not latest_xlsx() and href_fallback:
+        log("No download detected after click, trying direct href navigation…")
+        driver.get(href_fallback)
+        time.sleep(2)
+
+    # 4) 等待 Excel 下載完成（觀察 .crdownload 與 .xlsx）
     timeout = time.time() + 120  # 最長等 120 秒
     xlsx_path = None
+    last_seen_status = ""
+
     while time.time() < timeout:
-        # 有 .crdownload 表示仍在下載
-        if any(name.endswith(".crdownload") for name in os.listdir(DOWNLOAD_DIR)):
+        crd = [n for n in os.listdir(DOWNLOAD_DIR) if n.endswith(".crdownload")]
+        xlsx = latest_xlsx()
+        status = f"crdownload={len(crd)}, xlsx={'yes' if xlsx else 'no'}"
+        if status != last_seen_status:
+            log(f"Downloading… ({status})")
+            last_seen_status = status
+
+        if crd:
             time.sleep(1)
             continue
-        xlsx_path = latest_xlsx()
-        if xlsx_path:
+
+        if xlsx:
+            xlsx_path = xlsx
             break
+
         time.sleep(1)
+
+    if not xlsx_path and href_fallback:
+        # 最後一搏：再嘗試一次導向
+        log("Retry direct navigation to export href once more…")
+        driver.get(href_fallback)
+        time.sleep(3)
+        xlsx = latest_xlsx()
+        if xlsx:
+            xlsx_path = xlsx
 
     if not xlsx_path:
         raise RuntimeError("未偵測到下載完成的 .xlsx 檔（可能被網站阻擋或按鈕定位失敗）。")
 
     log(f"Downloaded Excel: {os.path.basename(xlsx_path)}")
 
-    # === 5) 解析 Excel：自動定位正確工作表與表頭 ===
-    from openpyxl import load_workbook
+    # 5) 解析 Excel：自動定位正確工作表與表頭
     xls = pd.ExcelFile(xlsx_path, engine="openpyxl")
     target_df = None
 
     for sheet in xls.sheet_names:
-        # 先無表頭讀入，掃前 30 列找包含股票代號/名稱的表頭列
+        # 無表頭讀入，掃前 30 列找包含股票代號/名稱的表頭列
         raw = pd.read_excel(xls, sheet_name=sheet, header=None, dtype=str)
         found_header_row = None
         for r in range(min(30, len(raw))):
@@ -143,7 +205,7 @@ try:
                 found_header_row = r
                 break
         if found_header_row is None:
-            continue  # 很可能是封面或說明頁
+            continue  # 封面或說明頁，跳過
 
         df_try = pd.read_excel(xls, sheet_name=sheet, header=found_header_row)
         df_try.columns = _normalize_cols(df_try.columns)
@@ -162,7 +224,7 @@ try:
     if target_df is None:
         raise KeyError(f"在任何工作表都找不到必要欄位，請手動下載檔案檢查欄名。工作表={xls.sheet_names}")
 
-    # === 6) 數值清洗並輸出 CSV ===
+    # 6) 數值清洗並輸出 CSV
     for col in ["股數", "持股權重"]:
         target_df[col] = (
             target_df[col].astype(str)
