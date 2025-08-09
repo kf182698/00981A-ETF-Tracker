@@ -2,7 +2,7 @@ name: Daily ETF Tracker (Selenium)
 
 on:
   schedule:
-    - cron: '0 12 * * *'   # 每天台北時間 20:00
+    - cron: '0 12 * * *'   # 台北時間每日 20:00
   workflow_dispatch:
 
 jobs:
@@ -18,27 +18,19 @@ jobs:
         with:
           python-version: '3.10'
 
+      # 用官方 action 安裝 Chrome（避免自己 apt 安裝踩雷）
       - name: Install Chrome
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y wget gnupg unzip xvfb \
-            libglib2.0-0 libnss3 libgconf-2-4 libxss1 libappindicator3-1 \
-            fonts-liberation libasound2 libxshmfence1 libatk-bridge2.0-0 \
-            libdrm2 libgbm1 libxkbcommon0
-          wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
-          sudo apt-get install -y ./google-chrome-stable_current_amd64.deb
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: 'stable'
 
       - name: Install Python deps
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run tracker (headless Chrome)
-        env:
-          DISPLAY: ':99'
-        run: |
-          Xvfb :99 -screen 0 1280x1024x24 & sleep 3
-          python etf_tracker.py
+      - name: Run tracker (headless)
+        run: python etf_tracker.py
 
       - name: Compare with yesterday
         run: python compare_holdings.py
