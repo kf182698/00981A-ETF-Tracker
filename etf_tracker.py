@@ -153,7 +153,7 @@ try:
         driver.get(href_fallback)
         time.sleep(2)
 
-    # 4) 等待 Excel 下載完成（先等開始 → 再等大小穩定）
+   # 4) 等待 Excel 下載完成（先等開始 → 再等大小穩定）
 def list_crdownload():
     try:
         return [n for n in os.listdir(DOWNLOAD_DIR) if n.endswith(".crdownload")]
@@ -200,19 +200,17 @@ while time.time() < finish_deadline:
     status = f"crdownload={len(crd)}, xlsx={'yes' if xlsx else 'no'}"
     log(f"Downloading… ({status})")
 
-    # 有 xlsx 檔，且大小穩定，就視為完成
     if xlsx and size_stable(xlsx, checks=6, interval=0.8):
         xlsx_path = xlsx
         break
 
-    # 沒有 crdownload，但也找不到 xlsx → 再等一下（有些瀏覽器重命名稍有延遲）
     if not crd and not xlsx:
         time.sleep(1)
         continue
 
     time.sleep(1)
 
-# 最後保險一次：若仍未成功，但有 xlsx 且檔案 > 0，就放行
+# 最後保險一次
 if not xlsx_path:
     x = latest_xlsx_path()
     if x and os.path.getsize(x) > 0:
