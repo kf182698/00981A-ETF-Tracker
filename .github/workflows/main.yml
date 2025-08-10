@@ -37,6 +37,9 @@ jobs:
       - name: Compare with yesterday
         run: python compare_holdings.py
 
+      - name: Build reports (D1/D5/New>0.5%)
+        run: python build_reports.py
+
       - name: Send email
         env:
           EMAIL_USERNAME: ${{ secrets.EMAIL_USERNAME }}
