@@ -1,4 +1,4 @@
-# send_email.py  —— 完整版（含內嵌圖片修正）
+# send_email.py —— 完整版（內嵌圖片・摘要・附件）
 import os
 import glob
 import smtplib
@@ -17,7 +17,7 @@ USER = os.environ.get("EMAIL_USERNAME")
 PWD  = os.environ.get("EMAIL_PASSWORD")
 assert TO and USER and PWD, "請在 Secrets 設定 EMAIL_TO / EMAIL_USERNAME / EMAIL_PASSWORD"
 
-# ===== 路徑工具 =====
+# ===== 工具 =====
 def latest_file(pattern):
     files = glob.glob(pattern)
     return max(files, key=os.path.getmtime) if files else None
@@ -43,7 +43,7 @@ updown_path = latest_file(f"{REPORT_DIR}/up_down_today_{today}.csv")
 new_path    = latest_file(f"{REPORT_DIR}/new_gt_0p5_{today}.csv")
 w5d_path    = latest_file(f"{REPORT_DIR}/weights_chg_5d_{today}.csv")
 
-# 圖片
+# 圖片（可能沒有就回退到最近一張）
 chart_d1    = latest_file(f"charts/d1_top_changes_{today}.png")
 chart_daily = latest_file(f"charts/daily_trend_{today}.png") or latest_file("charts/daily_trend_*.png")
 chart_week  = latest_file(f"charts/weekly_cum_trend_{today}.png") or latest_file("charts/weekly_cum_trend_*.png")
@@ -109,7 +109,7 @@ if df_updn is not None and not df_updn.empty:
     lines += to_lines(dn, f"▼ D1 權重下降 Top {TOP_N}")
     lines.append("")
 
-# 首次新增 > 阈值
+# 首次新增 > 閾值
 if df_new is not None and not df_new.empty:
     n = df_new.copy()
     if "今日權重%" in n.columns:
@@ -138,7 +138,7 @@ if df_5d is not None and not df_5d.empty:
     lines += to_lines5(dn5, f"⏬ D5 權重下降 Top {TOP_N}")
     lines.append("")
 
-# ===== 組信：text + html + inline images（正確順序） =====
+# ===== 組信：text + html + inline images（正確流程） =====
 subject = f"[ETF追蹤通知] 00981A 投資組合變動報告（{today}）"
 
 msg = EmailMessage()
@@ -146,6 +146,7 @@ msg["From"] = USER
 msg["To"]   = TO
 msg["Subject"] = subject
 
+# 純文字版本
 text_body = (
     "您好，\n\n"
     f"00981A 今日追蹤摘要（{today}）\n" +
@@ -154,47 +155,48 @@ text_body = (
 )
 msg.set_content(text_body)
 
-# 先建立 HTML 範本（用占位符插圖）
+# 先產 CID（如果圖片檔存在才產）
+def cid_if_exists(path):
+    return make_msgid(domain="charts.local")[1:-1] if path and os.path.exists(path) else None
+
+cid_d1    = cid_if_exists(chart_d1)
+cid_daily = cid_if_exists(chart_daily)
+cid_week  = cid_if_exists(chart_week)
+
+# HTML 內容（把 CID 放進 <img src="cid:...">）
 html_lines = "<br>".join(lines).replace("  - ", "&nbsp;&nbsp;- ")
-html_tpl = f"""
+html_final = f"""
 <html>
   <body>
     <p>您好，</p>
     <p>00981A 今日追蹤摘要（{today}）</p>
     <pre style="font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px;">{html_lines}</pre>
     <p><b>D1 增減幅度排序圖</b></p>
-    {{IMG_D1}}
+    {f'<img src="cid:{cid_d1}" />' if cid_d1 else '<i>(無圖)</i>'}
     <p><b>每日權重趨勢（Top Movers x5）</b></p>
-    {{IMG_DAILY}}
+    {f'<img src="cid:{cid_daily}" />' if cid_daily else '<i>(無圖)</i>'}
     <p><b>週累積權重變化（對第一週）</b></p>
-    {{IMG_WEEK}}
+    {f'<img src="cid:{cid_week}" />' if cid_week else '<i>(無圖)</i>'}
     <p>（若看不到圖片，請查看附件 PNG 檔）</p>
   </body>
 </html>
 """
+# 加入 HTML part
+msg.add_alternative(html_final, subtype="html")
 
-# 先加 HTML part，拿到可 add_related 的 part
-html_part = msg.add_alternative(html_tpl, subtype="html")
+# 取得 HTML part（注意：add_alternative 不回傳 part，要用 get_body）
+html_part = msg.get_body(preferencelist=('html',))
 
-def embed_img(html_part, path):
-    if not path or not os.path.exists(path):
-        return None
-    cid = make_msgid(domain="charts.local")  # 回傳形如 <...>
+# 把圖片資料以同一個 CID 內嵌到 HTML part
+def embed(html_part, path, cid):
+    if not (html_part and path and os.path.exists(path) and cid):
+        return
     with open(path, "rb") as f:
-        html_part.add_related(f.read(), maintype="image", subtype="png", cid=cid)
-    return cid[1:-1]  # 去掉尖括號
+        html_part.add_related(f.read(), maintype="image", subtype="png", cid=f"<{cid}>")
 
-cid_d1    = embed_img(html_part, chart_d1)
-cid_daily = embed_img(html_part, chart_daily)
-cid_week  = embed_img(html_part, chart_week)
-
-# 用實際 CID 取代占位符
-html_final = (html_tpl
-              .replace("{IMG_D1}",    f'<img src="cid:{cid_d1}" />'    if cid_d1    else "<i>(無圖)</i>")
-              .replace("{IMG_DAILY}", f'<img src="cid:{cid_daily}" />' if cid_daily else "<i>(無圖)</i>")
-              .replace("{IMG_WEEK}",  f'<img src="cid:{cid_week}" />'  if cid_week  else "<i>(無圖)</i>")
-             )
-html_part.set_content(html_final, subtype="html")
+embed(html_part, chart_d1,    cid_d1)
+embed(html_part, chart_daily, cid_daily)
+embed(html_part, chart_week,  cid_week)
 
 # ===== 附件（報表 + 圖片備援）=====
 def attach_file(path):
