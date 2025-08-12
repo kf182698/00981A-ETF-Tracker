@@ -1,4 +1,4 @@
-# send_email.py —— 完整版（內嵌圖片・摘要・附件）
+# send_email.py —— 完整版（含內嵌圖片、賣出警示、三份報表與三張圖）
 import os
 import glob
 import smtplib
@@ -9,7 +9,14 @@ import pandas as pd
 from email.message import EmailMessage
 from email.utils import make_msgid
 
-from config import TOP_N, THRESH_UPDOWN_EPS, NEW_WEIGHT_MIN, REPORT_DIR, PCT_DECIMALS
+from config import (
+    TOP_N,
+    THRESH_UPDOWN_EPS,
+    NEW_WEIGHT_MIN,
+    SELL_ALERT_THRESHOLD,
+    REPORT_DIR,
+    PCT_DECIMALS,
+)
 
 # ===== Secrets（環境變數） =====
 TO   = os.environ.get("EMAIL_TO")
@@ -18,12 +25,12 @@ PWD  = os.environ.get("EMAIL_PASSWORD")
 assert TO and USER and PWD, "請在 Secrets 設定 EMAIL_TO / EMAIL_USERNAME / EMAIL_PASSWORD"
 
 # ===== 工具 =====
-def latest_file(pattern):
+def latest_file(pattern: str):
     files = glob.glob(pattern)
     return max(files, key=os.path.getmtime) if files else None
 
-def read_csv_safe(p):
-    return pd.read_csv(p) if p and os.path.exists(p) else None
+def read_csv_safe(path: str):
+    return pd.read_csv(path) if path and os.path.exists(path) else None
 
 def fmt_pct(v):
     try:
@@ -39,13 +46,14 @@ today = datetime.today().strftime("%Y-%m-%d")
 
 data_path   = latest_file(f"data/{today}.csv") or latest_file("data/*.csv")
 diff_path   = latest_file(f"diff/diff_{today}.csv") or latest_file("diff/*.csv")
-updown_path = latest_file(f"{REPORT_DIR}/up_down_today_{today}.csv")
-new_path    = latest_file(f"{REPORT_DIR}/new_gt_0p5_{today}.csv")
-w5d_path    = latest_file(f"{REPORT_DIR}/weights_chg_5d_{today}.csv")
+updown_path = latest_file(f"{REPORT_DIR}/up_down_today_{today}.csv") or latest_file(f"{REPORT_DIR}/up_down_today_*.csv")
+new_path    = latest_file(f"{REPORT_DIR}/new_gt_0p5_{today}.csv") or latest_file(f"{REPORT_DIR}/new_gt_*_{today}.csv") or latest_file(f"{REPORT_DIR}/new_gt_*_*.csv")
+w5d_path    = latest_file(f"{REPORT_DIR}/weights_chg_5d_{today}.csv") or latest_file(f"{REPORT_DIR}/weights_chg_5d_*.csv")
+sell_path   = latest_file(f"{REPORT_DIR}/sell_alerts_{today}.csv") or latest_file(f"{REPORT_DIR}/sell_alerts_*.csv")
 
 # 圖片（可能沒有就回退到最近一張）
-chart_d1    = latest_file(f"charts/d1_top_changes_{today}.png")
-chart_daily = latest_file(f"charts/daily_trend_{today}.png") or latest_file("charts/daily_trend_*.png")
+chart_d1    = latest_file(f"charts/d1_top_changes_{today}.png") or latest_file("charts/d1_top_changes_*.png")
+chart_daily = latest_file(f"charts/daily_trend_{today}.png")   or latest_file("charts/daily_trend_*.png")
 chart_week  = latest_file(f"charts/weekly_cum_trend_{today}.png") or latest_file("charts/weekly_cum_trend_*.png")
 
 # ===== 讀資料 =====
@@ -53,6 +61,7 @@ df_data = read_csv_safe(data_path)
 df_updn = read_csv_safe(updown_path)
 df_new  = read_csv_safe(new_path)
 df_5d   = read_csv_safe(w5d_path)
+df_sell = read_csv_safe(sell_path)
 
 # ===== 摘要組裝 =====
 lines = []
@@ -63,7 +72,8 @@ def top_weights_summary(df_today: pd.DataFrame):
     col = None
     for c in ["持股權重","持股比例","權重","占比","比重(%)","占比(%)"]:
         if c in df.columns:
-            col = c; break
+            col = c
+            break
     if col is None:
         df["w"] = 0.0
     else:
@@ -108,11 +118,15 @@ if df_updn is not None and not df_updn.empty:
     lines += to_lines(up, f"▲ D1 權重上升 Top {TOP_N}")
     lines += to_lines(dn, f"▼ D1 權重下降 Top {TOP_N}")
     lines.append("")
+else:
+    lines.append(f"（無 D1 報表或變動低於噪音門檻 {THRESH_UPDOWN_EPS:.2f}%）")
+    lines.append("")
 
-# 首次新增 > 閾值
+# 首次新增 > 閾值（門檻可調）
 if df_new is not None and not df_new.empty:
     n = df_new.copy()
     if "今日權重%" in n.columns:
+        n["今日權重%"] = pd.to_numeric(n["今日權重%"], errors="coerce").fillna(0.0)
         n = n.sort_values("今日權重%", ascending=False)
     lines.append(f"🆕 首次新增持股（權重 > {NEW_WEIGHT_MIN:.2f}%）：{len(n)} 檔")
     for _, r in n.iterrows():
@@ -120,6 +134,21 @@ if df_new is not None and not df_new.empty:
     lines.append("")
 else:
     lines.append(f"🆕 首次新增持股（權重 > {NEW_WEIGHT_MIN:.2f}%）：0 檔")
+    lines.append("")
+
+# ⚠️ 關鍵賣出警示（今日 ≤ 閾值且昨日 > 閾值，且 D1 為負）
+if df_sell is not None and not df_sell.empty:
+    s = df_sell.copy()
+    for c in ["昨日權重%","今日權重%","Δ%"]:
+        s[c] = pd.to_numeric(s[c], errors="coerce").fillna(0.0)
+    lines.append(f"⚠️ 關鍵賣出警示（今日 ≤ {SELL_ALERT_THRESHOLD:.2f}% 且昨日 > 閾值）：{len(s)} 檔")
+    # 依降幅排序
+    s = s.sort_values("Δ%", ascending=True)
+    for _, r in s.iterrows():
+        lines.append(f"  - {r['股票代號']} {r['股票名稱']}: {r['昨日權重%']:.2f}% → {r['今日權重%']:.2f}%（{r['Δ%']:+.{PCT_DECIMALS}f}%）")
+    lines.append("")
+else:
+    lines.append(f"⚠️ 關鍵賣出警示：0 檔（門檻 {SELL_ALERT_THRESHOLD:.2f}%）")
     lines.append("")
 
 # D5 上/下 TopN
@@ -136,6 +165,9 @@ if df_5d is not None and not df_5d.empty:
         return out
     lines += to_lines5(up5, f"⏫ D5 權重上升 Top {TOP_N}")
     lines += to_lines5(dn5, f"⏬ D5 權重下降 Top {TOP_N}")
+    lines.append("")
+else:
+    lines.append("（歷史不足 5 份快照，暫無 D5 報表）")
     lines.append("")
 
 # ===== 組信：text + html + inline images（正確流程） =====
@@ -209,7 +241,7 @@ def attach_file(path):
     with open(path, "rb") as f:
         msg.add_attachment(f.read(), maintype=maintype, subtype=subtype, filename=os.path.basename(path))
 
-for p in [data_path, diff_path, updown_path, new_path, w5d_path, chart_d1, chart_daily, chart_week]:
+for p in [data_path, diff_path, updown_path, new_path, w5d_path, sell_path, chart_d1, chart_daily, chart_week]:
     attach_file(p)
 
 # ===== 寄信 =====
