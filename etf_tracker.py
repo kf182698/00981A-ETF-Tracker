@@ -1,6 +1,7 @@
-# === 取代你檔案內『啟動 Chrome』到『點擊與下載』的那段（含重試與截圖） ===
-# ……前略：imports 與常數沿用你原檔……
-
+import os
+import time
+import glob
+import pandas as pd
 import uuid
 
 SCREEN_DIR = os.path.abspath("screenshots")
