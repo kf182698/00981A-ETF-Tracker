@@ -1,4 +1,4 @@
-# send_email.py —— 完整版（含內嵌圖片、賣出警示、三份報表與三張圖）
+# send_email.py —— 完整版（含內嵌圖片、賣出警示、三份報表、每日變化表「嵌入Email」）
 import os
 import glob
 import smtplib
@@ -41,6 +41,53 @@ def fmt_pct(v):
 def fmt_pair(y, t):
     return f"{fmt_pct(y)} → {fmt_pct(t)}"
 
+def df_to_html_table(df: pd.DataFrame, max_rows: int = 30) -> str:
+    """將 DataFrame 渲染為簡潔 HTML 表格（前 max_rows 列），含簡單樣式"""
+    if df is None or df.empty:
+        return "<i>(今日無變化表資料)</i>"
+    view = df.head(max_rows).copy()
+    # 數值欄位加上格式（不改原檔，僅渲染）
+    for col in view.columns:
+        if view[col].dtype.kind in "if":
+            if "權重" in col:
+                view[col] = view[col].map(lambda x: fmt_pct(x))
+            else:
+                # 股數/買賣超加千分位
+                view[col] = view[col].map(lambda x: f"{int(x):,}" if pd.notna(x) else "")
+    # 安全轉字串
+    view = view.fillna("").astype(str)
+
+    # inline CSS：各家郵件客戶端友善
+    style = """
+      style="
+        border-collapse:collapse;
+        width:100%;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', 'PingFang TC', 'Microsoft JhengHei', sans-serif;
+        font-size:13px;"
+    """
+    th_style = 'style="background:#f5f6f7;border:1px solid #ddd;padding:6px;text-align:center;"'
+    td_style = 'style="border:1px solid #ddd;padding:6px;text-align:right;white-space:nowrap;"'
+    td_left  = 'style="border:1px solid #ddd;padding:6px;text-align:left;white-space:nowrap;"'
+
+    # 建表頭
+    cols = list(view.columns)
+    html = [f"<table {style}>", "<thead><tr>"]
+    for c in cols:
+        html.append(f"<th {th_style}>{c}</th>")
+    html.append("</tr></thead><tbody>")
+
+    # 建資料列
+    for _, r in view.iterrows():
+        html.append("<tr>")
+        for i, c in enumerate(cols):
+            cell_style = td_left if ("股票代號" in c or "股票名稱" in c) else td_style
+            html.append(f"<td {cell_style}>{r[c]}</td>")
+        html.append("</tr>")
+    html.append("</tbody></table>")
+    if len(df) > max_rows:
+        html.append(f'<div style="color:#666;font-size:12px;margin-top:4px;">(僅顯示前 {max_rows} 列，完整內容見附件 Excel)</div>')
+    return "".join(html)
+
 # ===== 找檔 =====
 today = datetime.today().strftime("%Y-%m-%d")
 
@@ -51,17 +98,22 @@ new_path    = latest_file(f"{REPORT_DIR}/new_gt_0p5_{today}.csv") or latest_file
 w5d_path    = latest_file(f"{REPORT_DIR}/weights_chg_5d_{today}.csv") or latest_file(f"{REPORT_DIR}/weights_chg_5d_*.csv")
 sell_path   = latest_file(f"{REPORT_DIR}/sell_alerts_{today}.csv") or latest_file(f"{REPORT_DIR}/sell_alerts_*.csv")
 
+# 新增：每日變化表（CSV/Excel）
+change_csv  = latest_file(f"{REPORT_DIR}/holdings_change_table_{today}.csv") or latest_file(f"{REPORT_DIR}/holdings_change_table_*.csv")
+change_xlsx = latest_file(f"{REPORT_DIR}/holdings_change_table_{today}.xlsx") or latest_file(f"{REPORT_DIR}/holdings_change_table_*.xlsx")
+
 # 圖片（可能沒有就回退到最近一張）
 chart_d1    = latest_file(f"charts/d1_top_changes_{today}.png") or latest_file("charts/d1_top_changes_*.png")
 chart_daily = latest_file(f"charts/daily_trend_{today}.png")   or latest_file("charts/daily_trend_*.png")
 chart_week  = latest_file(f"charts/weekly_cum_trend_{today}.png") or latest_file("charts/weekly_cum_trend_*.png")
 
 # ===== 讀資料 =====
-df_data = read_csv_safe(data_path)
-df_updn = read_csv_safe(updown_path)
-df_new  = read_csv_safe(new_path)
-df_5d   = read_csv_safe(w5d_path)
-df_sell = read_csv_safe(sell_path)
+df_data   = read_csv_safe(data_path)
+df_updn   = read_csv_safe(updown_path)
+df_new    = read_csv_safe(new_path)
+df_5d     = read_csv_safe(w5d_path)
+df_sell   = read_csv_safe(sell_path)
+df_change = read_csv_safe(change_csv)
 
 # ===== 摘要組裝 =====
 lines = []
@@ -142,7 +194,6 @@ if df_sell is not None and not df_sell.empty:
     for c in ["昨日權重%","今日權重%","Δ%"]:
         s[c] = pd.to_numeric(s[c], errors="coerce").fillna(0.0)
     lines.append(f"⚠️ 關鍵賣出警示（今日 ≤ {SELL_ALERT_THRESHOLD:.2f}% 且昨日 > 閾值）：{len(s)} 檔")
-    # 依降幅排序
     s = s.sort_values("Δ%", ascending=True)
     for _, r in s.iterrows():
         lines.append(f"  - {r['股票代號']} {r['股票名稱']}: {r['昨日權重%']:.2f}% → {r['今日權重%']:.2f}%（{r['Δ%']:+.{PCT_DECIMALS}f}%）")
@@ -178,12 +229,12 @@ msg["From"] = USER
 msg["To"]   = TO
 msg["Subject"] = subject
 
-# 純文字版本
+# 純文字版本（不含表格）
 text_body = (
     "您好，\n\n"
     f"00981A 今日追蹤摘要（{today}）\n" +
     "\n".join(lines) +
-    "\n\n（若看不到圖片，請查看附件）\n"
+    "\n\n（若看不到圖片/表格，請查看附件）\n"
 )
 msg.set_content(text_body)
 
@@ -195,21 +246,31 @@ cid_d1    = cid_if_exists(chart_d1)
 cid_daily = cid_if_exists(chart_daily)
 cid_week  = cid_if_exists(chart_week)
 
-# HTML 內容（把 CID 放進 <img src="cid:...">）
+# 變化表：轉成 HTML（最多 30 列）
+change_table_html = df_to_html_table(df_change, max_rows=30)
+
+# HTML 內容（把 CID 放進 <img src="cid:...">），並嵌入變化表
 html_lines = "<br>".join(lines).replace("  - ", "&nbsp;&nbsp;- ")
 html_final = f"""
 <html>
   <body>
     <p>您好，</p>
     <p>00981A 今日追蹤摘要（{today}）</p>
-    <pre style="font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px;">{html_lines}</pre>
-    <p><b>D1 增減幅度排序圖</b></p>
+    <pre style="font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; white-space: pre-wrap;">{html_lines}</pre>
+
+    <h3 style="margin:12px 0 8px 0;">📊 每日持股變化追蹤表</h3>
+    {change_table_html}
+
+    <h3 style="margin:16px 0 8px 0;">D1 增減幅度排序圖</h3>
     {f'<img src="cid:{cid_d1}" />' if cid_d1 else '<i>(無圖)</i>'}
-    <p><b>每日權重趨勢（Top Movers x5）</b></p>
+
+    <h3 style="margin:16px 0 8px 0;">每日權重趨勢（Top Movers x5）</h3>
     {f'<img src="cid:{cid_daily}" />' if cid_daily else '<i>(無圖)</i>'}
-    <p><b>週累積權重變化（對第一週）</b></p>
+
+    <h3 style="margin:16px 0 8px 0;">週累積權重變化（對第一週）</h3>
     {f'<img src="cid:{cid_week}" />' if cid_week else '<i>(無圖)</i>'}
-    <p>（若看不到圖片，請查看附件 PNG 檔）</p>
+
+    <p style="color:#666;">（若看不到圖片/表格，請查看附件 CSV / Excel / PNG 檔）</p>
   </body>
 </html>
 """
@@ -230,7 +291,7 @@ embed(html_part, chart_d1,    cid_d1)
 embed(html_part, chart_daily, cid_daily)
 embed(html_part, chart_week,  cid_week)
 
-# ===== 附件（報表 + 圖片備援）=====
+# ===== 附件（報表 + 表格 + 圖片備援）=====
 def attach_file(path):
     if not path or not os.path.exists(path):
         return
@@ -241,7 +302,11 @@ def attach_file(path):
     with open(path, "rb") as f:
         msg.add_attachment(f.read(), maintype=maintype, subtype=subtype, filename=os.path.basename(path))
 
-for p in [data_path, diff_path, updown_path, new_path, w5d_path, sell_path, chart_d1, chart_daily, chart_week]:
+for p in [
+    data_path, diff_path, updown_path, new_path, w5d_path, sell_path,
+    change_csv, change_xlsx,
+    chart_d1, chart_daily, chart_week
+]:
     attach_file(p)
 
 # ===== 寄信 =====
