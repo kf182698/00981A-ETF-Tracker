@@ -1,4 +1,4 @@
-# charts.py
+# charts.py — Daily/Weekly trend charts with English titles & legends
 import os
 import re
 import glob
@@ -6,7 +6,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from pathlib import Path
 from datetime import datetime
-from config import TOP_N, REPORT_DIR, CHART_DIR, PCT_DECIMALS, SMOOTH_ROLLING_WINDOW
+from config import TOP_N, REPORT_DIR, CHART_DIR, SMOOTH_ROLLING_WINDOW
 
 DATA_DIR = "data"
 Path(CHART_DIR).mkdir(parents=True, exist_ok=True)
@@ -77,11 +77,12 @@ def chart_d1_bar(today):
 
     plt.figure(figsize=(10, 6))
     y = range(len(labels))
-    plt.barh(y, vals)
+    plt.barh(y, vals, color=["green" if v>0 else "red" for v in vals])
     plt.yticks(y, labels)
-    plt.axvline(0, linewidth=1)
-    plt.title(f"D1 權重變動 Top{TOP_N}（上/下） - {today}")
-    plt.xlabel("Δ (百分點)")
+    plt.axvline(0, linewidth=1, color="black")
+    plt.title(f"D1 Weight Change (Top {TOP_N} Up/Down) - {today}")  # English title
+    plt.xlabel("Δ (percentage points)")  # English axis
+    plt.ylabel("Stock ID")
     out = os.path.join(CHART_DIR, f"d1_top_changes_{today}.png")
     plt.tight_layout(); plt.savefig(out, dpi=150); plt.close()
     return out
@@ -91,7 +92,7 @@ def chart_daily_trend(today):
     if not dates: return None
     if today not in dates: today = dates[-1]
     idx = dates.index(today)
-    span = dates[max(0, idx-11): idx+1]
+    span = dates[max(0, idx-11): idx+1]  # last ~12 snapshots
 
     top_codes = _pick_top5_for_trend(today)
     if not top_codes: return None
@@ -105,15 +106,17 @@ def chart_daily_trend(today):
     if not panel: return None
 
     mat = pd.DataFrame(panel).T.sort_index()
-    mat = mat.fillna(method="ffill")  # 缺檔日前值補齊
+    mat = mat.fillna(method="ffill")
     smooth = mat.rolling(window=max(1, SMOOTH_ROLLING_WINDOW), center=True, min_periods=1).mean()
 
     plt.figure(figsize=(10, 6))
     for code in smooth.columns:
-        plt.plot(smooth.index, smooth[code], marker=None, linewidth=2)
-    plt.title(f"每日權重趨勢（Top Movers x5） - {span[0]} → {span[-1]}")
-    plt.xlabel("日期"); plt.ylabel("權重（%）")
+        plt.plot(smooth.index, smooth[code], linewidth=2, label=str(code))
+    plt.title(f"Daily Weight Trend (Top Movers x5) - {span[0]} → {span[-1]}")
+    plt.xlabel("Date"); plt.ylabel("Weight (%)")
     plt.xticks(rotation=45, ha="right")
+    plt.grid(True, axis="y", alpha=0.3)
+    plt.legend(loc="best", frameon=True)
     out = os.path.join(CHART_DIR, f"daily_trend_{span[-1]}.png")
     plt.tight_layout(); plt.savefig(out, dpi=150); plt.close()
     return out
@@ -139,27 +142,29 @@ def chart_weekly_cum_trend(today):
     mat = pd.concat(rows, ignore_index=True)
     mat["week"] = mat["date"].dt.to_period("W").apply(lambda p: p.start_time.date())
     pivot = mat.pivot_table(index=["week"], columns="股票代號", values="w", aggfunc="mean").sort_index()
-    pivot = pivot.fillna(method="ffill")  # 週內補前值
+    pivot = pivot.fillna(method="ffill")
     base = pivot.iloc[0]
     cum = (pivot - base)
     smooth = cum.rolling(window=max(1, SMOOTH_ROLLING_WINDOW), center=True, min_periods=1).mean()
 
     plt.figure(figsize=(10, 6))
     for code in smooth.columns:
-        plt.plot(smooth.index, smooth[code], marker=None, linewidth=2)
-    plt.title(f"週累積權重變化（對第一週） - {smooth.index.min()} → {smooth.index.max()}")
-    plt.xlabel("週起始日"); plt.ylabel("累積變化（百分點）")
+        plt.plot(smooth.index, smooth[code], linewidth=2, label=str(code))
+    plt.title("Weekly Cumulative Weight Change (vs first week)")
+    plt.xlabel("Week start"); plt.ylabel("Δ (percentage points)")
     plt.xticks(rotation=45, ha="right")
+    plt.grid(True, axis="y", alpha=0.3)
+    plt.legend(loc="best", frameon=True)
     out = os.path.join(CHART_DIR, f"weekly_cum_trend_{today}.png")
     plt.tight_layout(); plt.savefig(out, dpi=150); plt.close()
     return out
 
 def main():
     today = datetime.today().strftime("%Y-%m-%d")
-    p1 = chart_d1_bar(today)
-    p2 = chart_daily_trend(today)
-    p3 = chart_weekly_cum_trend(today)
-    print("Charts:", p1, p2, p3)
+    chart_d1_bar(today)
+    chart_daily_trend(today)
+    chart_weekly_cum_trend(today)
+    print("Charts generated for", today)
 
 if __name__ == "__main__":
     main()
