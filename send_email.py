@@ -1,4 +1,4 @@
-# send_email.py —— 完整版（含內嵌圖片、賣出警示、三份報表、每日變化表「嵌入Email」）
+# send_email.py —— 含內嵌圖片、賣出警示、每日變化表＆「新增持股顯示收盤價」
 import os
 import glob
 import smtplib
@@ -18,7 +18,7 @@ from config import (
     PCT_DECIMALS,
 )
 
-# ===== Secrets（環境變數） =====
+# ===== Secrets =====
 TO   = os.environ.get("EMAIL_TO")
 USER = os.environ.get("EMAIL_USERNAME")
 PWD  = os.environ.get("EMAIL_PASSWORD")
@@ -42,44 +42,33 @@ def fmt_pair(y, t):
     return f"{fmt_pct(y)} → {fmt_pct(t)}"
 
 def df_to_html_table(df: pd.DataFrame, max_rows: int = 30) -> str:
-    """將 DataFrame 渲染為簡潔 HTML 表格（前 max_rows 列），含簡單樣式"""
     if df is None or df.empty:
         return "<i>(今日無變化表資料)</i>"
     view = df.head(max_rows).copy()
-    # 數值欄位加上格式（不改原檔，僅渲染）
     for col in view.columns:
         if view[col].dtype.kind in "if":
             if "權重" in col:
                 view[col] = view[col].map(lambda x: fmt_pct(x))
             else:
-                # 股數/買賣超加千分位
                 view[col] = view[col].map(lambda x: f"{int(x):,}" if pd.notna(x) else "")
-    # 安全轉字串
     view = view.fillna("").astype(str)
-
-    # inline CSS：各家郵件客戶端友善
     style = """
       style="
         border-collapse:collapse;
         width:100%;
-        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', 'PingFang TC', 'Microsoft JhengHei', sans-serif;
+        font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,'Noto Sans','PingFang TC','Microsoft JhengHei',sans-serif;
         font-size:13px;"
     """
     th_style = 'style="background:#f5f6f7;border:1px solid #ddd;padding:6px;text-align:center;"'
     td_style = 'style="border:1px solid #ddd;padding:6px;text-align:right;white-space:nowrap;"'
     td_left  = 'style="border:1px solid #ddd;padding:6px;text-align:left;white-space:nowrap;"'
-
-    # 建表頭
     cols = list(view.columns)
     html = [f"<table {style}>", "<thead><tr>"]
-    for c in cols:
-        html.append(f"<th {th_style}>{c}</th>")
+    for c in cols: html.append(f"<th {th_style}>{c}</th>")
     html.append("</tr></thead><tbody>")
-
-    # 建資料列
     for _, r in view.iterrows():
         html.append("<tr>")
-        for i, c in enumerate(cols):
+        for c in cols:
             cell_style = td_left if ("股票代號" in c or "股票名稱" in c) else td_style
             html.append(f"<td {cell_style}>{r[c]}</td>")
         html.append("</tr>")
@@ -97,18 +86,15 @@ updown_path = latest_file(f"{REPORT_DIR}/up_down_today_{today}.csv") or latest_f
 new_path    = latest_file(f"{REPORT_DIR}/new_gt_0p5_{today}.csv") or latest_file(f"{REPORT_DIR}/new_gt_*_{today}.csv") or latest_file(f"{REPORT_DIR}/new_gt_*_*.csv")
 w5d_path    = latest_file(f"{REPORT_DIR}/weights_chg_5d_{today}.csv") or latest_file(f"{REPORT_DIR}/weights_chg_5d_*.csv")
 sell_path   = latest_file(f"{REPORT_DIR}/sell_alerts_{today}.csv") or latest_file(f"{REPORT_DIR}/sell_alerts_*.csv")
-
-# 新增：每日變化表（CSV/Excel）
 change_csv  = latest_file(f"{REPORT_DIR}/holdings_change_table_{today}.csv") or latest_file(f"{REPORT_DIR}/holdings_change_table_*.csv")
 change_xlsx = latest_file(f"{REPORT_DIR}/holdings_change_table_{today}.xlsx") or latest_file(f"{REPORT_DIR}/holdings_change_table_*.xlsx")
 
-# 圖片（可能沒有就回退到最近一張）
 chart_d1    = latest_file(f"charts/d1_top_changes_{today}.png") or latest_file("charts/d1_top_changes_*.png")
 chart_daily = latest_file(f"charts/daily_trend_{today}.png")   or latest_file("charts/daily_trend_*.png")
 chart_week  = latest_file(f"charts/weekly_cum_trend_{today}.png") or latest_file("charts/weekly_cum_trend_*.png")
 
 # ===== 讀資料 =====
-df_data   = read_csv_safe(data_path)
+df_today  = read_csv_safe(data_path)  # 含收盤價
 df_updn   = read_csv_safe(updown_path)
 df_new    = read_csv_safe(new_path)
 df_5d     = read_csv_safe(w5d_path)
@@ -123,9 +109,7 @@ def top_weights_summary(df_today: pd.DataFrame):
     df.columns = [str(c).strip().replace("　","").replace("\u3000","") for c in df.columns]
     col = None
     for c in ["持股權重","持股比例","權重","占比","比重(%)","占比(%)"]:
-        if c in df.columns:
-            col = c
-            break
+        if c in df.columns: col = c; break
     if col is None:
         df["w"] = 0.0
     else:
@@ -142,9 +126,8 @@ def top_weights_summary(df_today: pd.DataFrame):
         max_one = {"code":"-","name":"-","w":0.0}
     return total_rows, top10_sum, max_one
 
-# 基本概況
-if df_data is not None:
-    total_rows, top10_sum, max_one = top_weights_summary(df_data)
+if df_today is not None:
+    total_rows, top10_sum, max_one = top_weights_summary(df_today)
     lines += [
         f"▶ 今日總檔數：{total_rows}",
         f"▶ 前十大權重合計：{top10_sum:.2f}%",
@@ -174,21 +157,35 @@ else:
     lines.append(f"（無 D1 報表或變動低於噪音門檻 {THRESH_UPDOWN_EPS:.2f}%）")
     lines.append("")
 
-# 首次新增 > 閾值（門檻可調）
+# 首次新增 > 閾值（在名稱後面加上收盤價；沒有新增則不顯示價格段落）
 if df_new is not None and not df_new.empty:
     n = df_new.copy()
     if "今日權重%" in n.columns:
         n["今日權重%"] = pd.to_numeric(n["今日權重%"], errors="coerce").fillna(0.0)
         n = n.sort_values("今日權重%", ascending=False)
+
+    # 從當日 data CSV 取得收盤價對照
+    px_map = {}
+    if df_today is not None and "股票代號" in df_today.columns:
+        if "收盤價" in df_today.columns:
+            for _, r in df_today.iterrows():
+                px_map[str(r["股票代號"]).strip()] = r["收盤價"]
+
     lines.append(f"🆕 首次新增持股（權重 > {NEW_WEIGHT_MIN:.2f}%）：{len(n)} 檔")
     for _, r in n.iterrows():
-        lines.append(f"  - {r.get('股票代號','-')} {r.get('股票名稱','-')}: {fmt_pct(r.get('今日權重%'))}")
+        code = str(r.get('股票代號','')).strip()
+        name = r.get('股票名稱','-')
+        w = r.get('今日權重%')
+        price = px_map.get(code)
+        price_str = f"（收盤價：${price:.2f}）" if price and pd.notna(price) else ""
+        lines.append(f"  - {code} {name}: {fmt_pct(w)} {price_str}")
     lines.append("")
 else:
     lines.append(f"🆕 首次新增持股（權重 > {NEW_WEIGHT_MIN:.2f}%）：0 檔")
     lines.append("")
 
-# ⚠️ 關鍵賣出警示（今日 ≤ 閾值且昨日 > 閾值，且 D1 為負）
+# ⚠️ 關鍵賣出警示
+df_sell = read_csv_safe(sell_path)
 if df_sell is not None and not df_sell.empty:
     s = df_sell.copy()
     for c in ["昨日權重%","今日權重%","Δ%"]:
@@ -221,7 +218,7 @@ else:
     lines.append("（歷史不足 5 份快照，暫無 D5 報表）")
     lines.append("")
 
-# ===== 組信：text + html + inline images（正確流程） =====
+# ===== 組信 + 內嵌圖 + 表格 =====
 subject = f"[ETF追蹤通知] 00981A 投資組合變動報告（{today}）"
 
 msg = EmailMessage()
@@ -229,7 +226,6 @@ msg["From"] = USER
 msg["To"]   = TO
 msg["Subject"] = subject
 
-# 純文字版本（不含表格）
 text_body = (
     "您好，\n\n"
     f"00981A 今日追蹤摘要（{today}）\n" +
@@ -238,7 +234,6 @@ text_body = (
 )
 msg.set_content(text_body)
 
-# 先產 CID（如果圖片檔存在才產）
 def cid_if_exists(path):
     return make_msgid(domain="charts.local")[1:-1] if path and os.path.exists(path) else None
 
@@ -246,10 +241,8 @@ cid_d1    = cid_if_exists(chart_d1)
 cid_daily = cid_if_exists(chart_daily)
 cid_week  = cid_if_exists(chart_week)
 
-# 變化表：轉成 HTML（最多 30 列）
 change_table_html = df_to_html_table(df_change, max_rows=30)
 
-# HTML 內容（把 CID 放進 <img src="cid:...">），並嵌入變化表
 html_lines = "<br>".join(lines).replace("  - ", "&nbsp;&nbsp;- ")
 html_final = f"""
 <html>
@@ -274,16 +267,11 @@ html_final = f"""
   </body>
 </html>
 """
-# 加入 HTML part
 msg.add_alternative(html_final, subtype="html")
-
-# 取得 HTML part（注意：add_alternative 不回傳 part，要用 get_body）
 html_part = msg.get_body(preferencelist=('html',))
 
-# 把圖片資料以同一個 CID 內嵌到 HTML part
 def embed(html_part, path, cid):
-    if not (html_part and path and os.path.exists(path) and cid):
-        return
+    if not (html_part and path and os.path.exists(path) and cid): return
     with open(path, "rb") as f:
         html_part.add_related(f.read(), maintype="image", subtype="png", cid=f"<{cid}>")
 
@@ -291,13 +279,11 @@ embed(html_part, chart_d1,    cid_d1)
 embed(html_part, chart_daily, cid_daily)
 embed(html_part, chart_week,  cid_week)
 
-# ===== 附件（報表 + 表格 + 圖片備援）=====
+# ===== 附件 =====
 def attach_file(path):
-    if not path or not os.path.exists(path):
-        return
+    if not path or not os.path.exists(path): return
     ctype, encoding = mimetypes.guess_type(path)
-    if ctype is None or encoding is not None:
-        ctype = "application/octet-stream"
+    if ctype is None or encoding is not None: ctype = "application/octet-stream"
     maintype, subtype = ctype.split("/", 1)
     with open(path, "rb") as f:
         msg.add_attachment(f.read(), maintype=maintype, subtype=subtype, filename=os.path.basename(path))
@@ -309,7 +295,6 @@ for p in [
 ]:
     attach_file(p)
 
-# ===== 寄信 =====
 with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
     smtp.login(USER, PWD)
     smtp.send_message(msg)
