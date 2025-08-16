@@ -4,3 +4,4 @@ openpyxl
 chromedriver-autoinstaller
 matplotlib
 requests
+openpyxl
