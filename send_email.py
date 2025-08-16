@@ -1,13 +1,18 @@
-# send_email.py —— 含內嵌圖片、賣出警示、每日變化表＆「新增持股顯示收盤價」
+# send_email.py — Send via SendGrid HTTP API (CID inline images + attachments)
 import os
 import glob
-import smtplib
+import base64
 import mimetypes
 from datetime import datetime
 
 import pandas as pd
-from email.message import EmailMessage
 from email.utils import make_msgid
+
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import (
+    Mail, Email, To, Content, Attachment,
+    FileContent, FileName, FileType, Disposition, ContentId
+)
 
 from config import (
     TOP_N,
@@ -18,13 +23,13 @@ from config import (
     PCT_DECIMALS,
 )
 
-# ===== Secrets =====
+# ===== Secrets / Settings =====
 TO   = os.environ.get("EMAIL_TO")
-USER = os.environ.get("EMAIL_USERNAME")
-PWD  = os.environ.get("EMAIL_PASSWORD")
-assert TO and USER and PWD, "請在 Secrets 設定 EMAIL_TO / EMAIL_USERNAME / EMAIL_PASSWORD"
+FR   = os.environ.get("EMAIL_USERNAME") or "no-reply@example.com"  # 顯示寄件人
+SGK  = os.environ.get("SENDGRID_API_KEY")
+assert TO and FR and SGK, "請設定 EMAIL_TO / EMAIL_USERNAME / SENDGRID_API_KEY"
 
-# ===== 工具 =====
+# ===== Utilities =====
 def latest_file(pattern: str):
     files = glob.glob(pattern)
     return max(files, key=os.path.getmtime) if files else None
@@ -43,11 +48,11 @@ def fmt_pair(y, t):
 
 def df_to_html_table(df: pd.DataFrame, max_rows: int = 30) -> str:
     if df is None or df.empty:
-        return "<i>(今日無變化表資料)</i>"
+        return "<i>(No data for today)</i>"
     view = df.head(max_rows).copy()
     for col in view.columns:
         if view[col].dtype.kind in "if":
-            if "權重" in col:
+            if "權重" in col or "Weight" in col:
                 view[col] = view[col].map(lambda x: fmt_pct(x))
             else:
                 view[col] = view[col].map(lambda x: f"{int(x):,}" if pd.notna(x) else "")
@@ -69,15 +74,19 @@ def df_to_html_table(df: pd.DataFrame, max_rows: int = 30) -> str:
     for _, r in view.iterrows():
         html.append("<tr>")
         for c in cols:
-            cell_style = td_left if ("股票代號" in c or "股票名稱" in c) else td_style
+            cell_style = td_left if ("股票代號" in c or "股票名稱" in c or "Code" in c or "Name" in c) else td_style
             html.append(f"<td {cell_style}>{r[c]}</td>")
         html.append("</tr>")
     html.append("</tbody></table>")
     if len(df) > max_rows:
-        html.append(f'<div style="color:#666;font-size:12px;margin-top:4px;">(僅顯示前 {max_rows} 列，完整內容見附件 Excel)</div>')
+        html.append(f'<div style="color:#666;font-size:12px;margin-top:4px;">(Showing first {max_rows} rows; full table in attachment)</div>')
     return "".join(html)
 
-# ===== 找檔 =====
+def b64(path):
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode()
+
+# ===== Locate files =====
 today = datetime.today().strftime("%Y-%m-%d")
 
 data_path   = latest_file(f"data/{today}.csv") or latest_file("data/*.csv")
@@ -86,6 +95,7 @@ updown_path = latest_file(f"{REPORT_DIR}/up_down_today_{today}.csv") or latest_f
 new_path    = latest_file(f"{REPORT_DIR}/new_gt_0p5_{today}.csv") or latest_file(f"{REPORT_DIR}/new_gt_*_{today}.csv") or latest_file(f"{REPORT_DIR}/new_gt_*_*.csv")
 w5d_path    = latest_file(f"{REPORT_DIR}/weights_chg_5d_{today}.csv") or latest_file(f"{REPORT_DIR}/weights_chg_5d_*.csv")
 sell_path   = latest_file(f"{REPORT_DIR}/sell_alerts_{today}.csv") or latest_file(f"{REPORT_DIR}/sell_alerts_*.csv")
+
 change_csv  = latest_file(f"{REPORT_DIR}/holdings_change_table_{today}.csv") or latest_file(f"{REPORT_DIR}/holdings_change_table_*.csv")
 change_xlsx = latest_file(f"{REPORT_DIR}/holdings_change_table_{today}.xlsx") or latest_file(f"{REPORT_DIR}/holdings_change_table_*.xlsx")
 
@@ -93,15 +103,15 @@ chart_d1    = latest_file(f"charts/d1_top_changes_{today}.png") or latest_file("
 chart_daily = latest_file(f"charts/daily_trend_{today}.png")   or latest_file("charts/daily_trend_*.png")
 chart_week  = latest_file(f"charts/weekly_cum_trend_{today}.png") or latest_file("charts/weekly_cum_trend_*.png")
 
-# ===== 讀資料 =====
-df_today  = read_csv_safe(data_path)  # 含收盤價
+# ===== Read data =====
+df_today  = read_csv_safe(data_path)
 df_updn   = read_csv_safe(updown_path)
 df_new    = read_csv_safe(new_path)
 df_5d     = read_csv_safe(w5d_path)
 df_sell   = read_csv_safe(sell_path)
 df_change = read_csv_safe(change_csv)
 
-# ===== 摘要組裝 =====
+# ===== Build summary =====
 lines = []
 
 def top_weights_summary(df_today: pd.DataFrame):
@@ -137,7 +147,7 @@ if df_today is not None:
 else:
     lines.append("（今日資料缺失）")
 
-# D1 上/下 TopN
+# D1 TopN
 if df_updn is not None and not df_updn.empty:
     t = df_updn.copy()
     for c in ["Δ%","昨日權重%","今日權重%"]:
@@ -157,19 +167,17 @@ else:
     lines.append(f"（無 D1 報表或變動低於噪音門檻 {THRESH_UPDOWN_EPS:.2f}%）")
     lines.append("")
 
-# 首次新增 > 閾值（在名稱後面加上收盤價；沒有新增則不顯示價格段落）
+# New holdings > threshold — append close price in text
 if df_new is not None and not df_new.empty:
     n = df_new.copy()
     if "今日權重%" in n.columns:
         n["今日權重%"] = pd.to_numeric(n["今日權重%"], errors="coerce").fillna(0.0)
         n = n.sort_values("今日權重%", ascending=False)
 
-    # 從當日 data CSV 取得收盤價對照
     px_map = {}
-    if df_today is not None and "股票代號" in df_today.columns:
-        if "收盤價" in df_today.columns:
-            for _, r in df_today.iterrows():
-                px_map[str(r["股票代號"]).strip()] = r["收盤價"]
+    if df_today is not None and "股票代號" in df_today.columns and "收盤價" in df_today.columns:
+        for _, r in df_today.iterrows():
+            px_map[str(r["股票代號"]).strip()] = r["收盤價"]
 
     lines.append(f"🆕 首次新增持股（權重 > {NEW_WEIGHT_MIN:.2f}%）：{len(n)} 檔")
     for _, r in n.iterrows():
@@ -177,15 +185,14 @@ if df_new is not None and not df_new.empty:
         name = r.get('股票名稱','-')
         w = r.get('今日權重%')
         price = px_map.get(code)
-        price_str = f"（收盤價：${price:.2f}）" if price and pd.notna(price) else ""
+        price_str = f"（收盤價：${price:.2f}）" if price is not None and pd.notna(price) else ""
         lines.append(f"  - {code} {name}: {fmt_pct(w)} {price_str}")
     lines.append("")
 else:
     lines.append(f"🆕 首次新增持股（權重 > {NEW_WEIGHT_MIN:.2f}%）：0 檔")
     lines.append("")
 
-# ⚠️ 關鍵賣出警示
-df_sell = read_csv_safe(sell_path)
+# Sell alerts
 if df_sell is not None and not df_sell.empty:
     s = df_sell.copy()
     for c in ["昨日權重%","今日權重%","Δ%"]:
@@ -199,7 +206,7 @@ else:
     lines.append(f"⚠️ 關鍵賣出警示：0 檔（門檻 {SELL_ALERT_THRESHOLD:.2f}%）")
     lines.append("")
 
-# D5 上/下 TopN
+# D5 TopN
 if df_5d is not None and not df_5d.empty:
     t5 = df_5d.copy()
     for c in ["今日%","昨日%","D1Δ%","T-5日%","D5Δ%"]:
@@ -218,13 +225,8 @@ else:
     lines.append("（歷史不足 5 份快照，暫無 D5 報表）")
     lines.append("")
 
-# ===== 組信 + 內嵌圖 + 表格 =====
+# ===== Build HTML (with inline images via CID) =====
 subject = f"[ETF追蹤通知] 00981A 投資組合變動報告（{today}）"
-
-msg = EmailMessage()
-msg["From"] = USER
-msg["To"]   = TO
-msg["Subject"] = subject
 
 text_body = (
     "您好，\n\n"
@@ -232,7 +234,6 @@ text_body = (
     "\n".join(lines) +
     "\n\n（若看不到圖片/表格，請查看附件）\n"
 )
-msg.set_content(text_body)
 
 def cid_if_exists(path):
     return make_msgid(domain="charts.local")[1:-1] if path and os.path.exists(path) else None
@@ -242,51 +243,68 @@ cid_daily = cid_if_exists(chart_daily)
 cid_week  = cid_if_exists(chart_week)
 
 change_table_html = df_to_html_table(df_change, max_rows=30)
-
 html_lines = "<br>".join(lines).replace("  - ", "&nbsp;&nbsp;- ")
-html_final = f"""
-<html>
-  <body>
-    <p>您好，</p>
-    <p>00981A 今日追蹤摘要（{today}）</p>
-    <pre style="font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; white-space: pre-wrap;">{html_lines}</pre>
+html_body = f"""
+<p>您好，</p>
+<p>00981A 今日追蹤摘要（{today}）</p>
+<pre style="font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; white-space: pre-wrap;">{html_lines}</pre>
 
-    <h3 style="margin:12px 0 8px 0;">📊 每日持股變化追蹤表</h3>
-    {change_table_html}
+<h3 style="margin:12px 0 8px 0;">📊 每日持股變化追蹤表</h3>
+{change_table_html}
 
-    <h3 style="margin:16px 0 8px 0;">D1 增減幅度排序圖</h3>
-    {f'<img src="cid:{cid_d1}" />' if cid_d1 else '<i>(無圖)</i>'}
+<h3 style="margin:16px 0 8px 0;">D1 Weight Change</h3>
+{f'<img src="cid:{cid_d1}" />' if cid_d1 else '<i>(No image)</i>'}
 
-    <h3 style="margin:16px 0 8px 0;">每日權重趨勢（Top Movers x5）</h3>
-    {f'<img src="cid:{cid_daily}" />' if cid_daily else '<i>(無圖)</i>'}
+<h3 style="margin:16px 0 8px 0;">Daily Weight Trend (Top Movers x5)</h3>
+{f'<img src="cid:{cid_daily}" />' if cid_daily else '<i>(No image)</i>'}
 
-    <h3 style="margin:16px 0 8px 0;">週累積權重變化（對第一週）</h3>
-    {f'<img src="cid:{cid_week}" />' if cid_week else '<i>(無圖)</i>'}
+<h3 style="margin:16px 0 8px 0;">Weekly Cumulative Weight Change (vs first week)</h3>
+{f'<img src="cid:{cid_week}" />' if cid_week else '<i>(No image)</i>'}
 
-    <p style="color:#666;">（若看不到圖片/表格，請查看附件 CSV / Excel / PNG 檔）</p>
-  </body>
-</html>
+<p style="color:#666;">（若看不到圖片/表格，請查看附件 CSV / Excel / PNG 檔）</p>
 """
-msg.add_alternative(html_final, subtype="html")
-html_part = msg.get_body(preferencelist=('html',))
 
-def embed(html_part, path, cid):
-    if not (html_part and path and os.path.exists(path) and cid): return
+# ===== Build SendGrid Mail =====
+mail = Mail(
+    from_email=Email(FR),
+    to_emails=[To(TO)],
+    subject=subject,
+    html_content=Content("text/html", html_body),
+)
+# 同步加入純文字備份（避免只 HTML）
+mail.add_content(Content("text/plain", text_body))
+
+# Inline images with CID
+def attach_inline_image(path, cid):
+    if not (path and os.path.exists(path) and cid): return
+    ctype, _ = mimetypes.guess_type(path)
+    if not ctype: ctype = "image/png"
     with open(path, "rb") as f:
-        html_part.add_related(f.read(), maintype="image", subtype="png", cid=f"<{cid}>")
+        data = base64.b64encode(f.read()).decode()
+    att = Attachment()
+    att.file_content = FileContent(data)
+    att.file_type    = FileType(ctype)
+    att.file_name    = FileName(os.path.basename(path))
+    att.disposition  = Disposition("inline")
+    att.content_id   = ContentId(cid)  # <- cid for <img src="cid:...">
+    mail.add_attachment(att)
 
-embed(html_part, chart_d1,    cid_d1)
-embed(html_part, chart_daily, cid_daily)
-embed(html_part, chart_week,  cid_week)
+attach_inline_image(chart_d1,    cid_d1)
+attach_inline_image(chart_daily, cid_daily)
+attach_inline_image(chart_week,  cid_week)
 
-# ===== 附件 =====
+# Regular attachments (reports + images backup)
 def attach_file(path):
     if not path or not os.path.exists(path): return
-    ctype, encoding = mimetypes.guess_type(path)
-    if ctype is None or encoding is not None: ctype = "application/octet-stream"
-    maintype, subtype = ctype.split("/", 1)
-    with open(path, "rb") as f:
-        msg.add_attachment(f.read(), maintype=maintype, subtype=subtype, filename=os.path.basename(path))
+    ctype, _ = mimetypes.guess_type(path)
+    if not ctype: ctype = "application/octet-stream"
+    data = b64(path)
+    att = Attachment()
+    att.file_content = FileContent(data)
+    att.file_type    = FileType(ctype)
+    att.file_name    = FileName(os.path.basename(path))
+    att.disposition  = Disposition("attachment")
+    mail.add_attachment(att)
 
 for p in [
     data_path, diff_path, updown_path, new_path, w5d_path, sell_path,
@@ -295,8 +313,7 @@ for p in [
 ]:
     attach_file(p)
 
-with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
-    smtp.login(USER, PWD)
-    smtp.send_message(msg)
-
-print("Email sent to:", TO)
+# ===== Send via SendGrid HTTP API (port 443) =====
+sg = SendGridAPIClient(SGK)
+resp = sg.send(mail)
+print("SendGrid status:", resp.status_code)
