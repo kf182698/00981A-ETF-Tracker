@@ -1,14 +1,11 @@
 name: ETF Tracker
 
 on:
-  workflow_dispatch:         # 手動觸發（顯示 Run workflow 按鈕）
+  workflow_dispatch:        # 手動觸發 (Run workflow)
   schedule:
-    - cron: "0 12 * * *"     # 每天 20:00（台灣 UTC+8）=> 12:00 UTC
+    - cron: "0 12 * * *"    # 每天 20:00 (台灣 UTC+8 = 12:00 UTC)
   push:
     branches: [ main ]
-
-permissions:
-  contents: write
 
 jobs:
   run:
@@ -18,38 +15,27 @@ jobs:
       EMAIL_USERNAME: ${{ secrets.EMAIL_USERNAME }}
       SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
       SENDGRID_FROM: ${{ secrets.SENDGRID_FROM }}
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.10"
-      - run: pip install -r requirements.txt
-      - name: Run tracker
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run ETF tracker
         run: python etf_tracker.py
-      - name: Build reports
+
+      - name: Build change table
         run: python build_change_table.py
-      - name: Make charts
+
+      - name: Generate charts
         run: python charts.py
-      - name: Send email
+
+      - name: Send email report
         run: python send_email.py
-      env:
-      EMAIL_TO: ${{ secrets.EMAIL_TO }}
-      EMAIL_USERNAME: ${{ secrets.EMAIL_USERNAME }}
-      SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
-      SENDGRID_FROM: ${{ secrets.SENDGRID_FROM }} 
-
-
-        run: python send_email.py
-
-      - name: Commit results
-        shell: bash
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A
-          if git diff --cached --quiet; then
-            echo "No changes to commit."
-            exit 0
-          fi
-          git commit -m "Daily update: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          git push
