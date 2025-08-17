@@ -314,6 +314,30 @@ for p in [
     attach_file(p)
 
 # ===== Send via SendGrid HTTP API (port 443) =====
+from_email = os.environ.get("SENDGRID_FROM") or FR  # 優先用已驗證 Sender
+# 重建 mail 物件以套用新的 from（或你也可以在上面建 Mail 時就用 from_email）
+mail.from_email = Email(from_email)
+
+# 可選：把回覆信設為你想收件的地址（例如原本的 EMAIL_USERNAME）
+# from sendgrid.helpers.mail import ReplyTo
+# mail.reply_to = ReplyTo(FR)
+
 sg = SendGridAPIClient(SGK)
-resp = sg.send(mail)
-print("SendGrid status:", resp.status_code)
+try:
+    resp = sg.send(mail)
+    print("SendGrid status:", resp.status_code)
+    # 若非 202，印出 body 幫助除錯
+    if resp.status_code != 202:
+        try:
+            print("SendGrid response body:", resp.body.decode() if hasattr(resp.body, "decode") else resp.body)
+        except Exception:
+            print("SendGrid response body (raw):", resp.body)
+except Exception as e:
+    # 印出更完整的錯誤，SendGrid 會回 JSON 說明
+    body = getattr(e, "body", None)
+    if body:
+        try:
+            print("SendGrid error body:", body.decode() if hasattr(body, "decode") else body)
+        except Exception:
+            print("SendGrid error body (raw):", body)
+    raise
