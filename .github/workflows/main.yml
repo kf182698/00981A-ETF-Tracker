@@ -44,10 +44,12 @@ jobs:
         run: python charts.py
         
       - name: Send email
-        env:
-          EMAIL_USERNAME: ${{ secrets.EMAIL_USERNAME }}
-          EMAIL_TO: ${{ secrets.EMAIL_TO }}
-          SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
+      env:
+      EMAIL_TO: ${{ secrets.EMAIL_TO }}
+      EMAIL_USERNAME: ${{ secrets.EMAIL_USERNAME }}
+      SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
+      SENDGRID_FROM: ${{ secrets.SENDGRID_FROM }} 
+
 
         run: python send_email.py
 
