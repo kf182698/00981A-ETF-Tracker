@@ -1,9 +1,11 @@
-name: Daily ETF Tracker (Selenium)
+name: ETF Tracker
 
 on:
+  workflow_dispatch:         # 手動觸發（顯示 Run workflow 按鈕）
   schedule:
-    - cron: '0 12 * * *'   # 台北時間 20:00
-  workflow_dispatch:
+    - cron: "0 12 * * *"     # 每天 20:00（台灣 UTC+8）=> 12:00 UTC
+  push:
+    branches: [ main ]
 
 permissions:
   contents: write
