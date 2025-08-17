@@ -11,41 +11,27 @@ permissions:
   contents: write
 
 jobs:
-  run-tracker:
+  run:
     runs-on: ubuntu-latest
-
+    env:
+      EMAIL_TO: ${{ secrets.EMAIL_TO }}
+      EMAIL_USERNAME: ${{ secrets.EMAIL_USERNAME }}
+      SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
+      SENDGRID_FROM: ${{ secrets.SENDGRID_FROM }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
-
-      - name: Install Chrome
-        uses: browser-actions/setup-chrome@v1
-        with:
-          chrome-version: 'stable'
-
-      - name: Install Python deps
-        run: |
-          pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Run tracker (headless)
+          python-version: "3.10"
+      - run: pip install -r requirements.txt
+      - name: Run tracker
         run: python etf_tracker.py
-
-      - name: Compare with yesterday
-        run: python compare_holdings.py
-
-      - name: Build reports (D1/D5/New>0.5%)
-        run: python build_reports.py
-        
-      - name: Render charts
+      - name: Build reports
+        run: python build_change_table.py
+      - name: Make charts
         run: python charts.py
-        
       - name: Send email
+        run: python send_email.py
       env:
       EMAIL_TO: ${{ secrets.EMAIL_TO }}
       EMAIL_USERNAME: ${{ secrets.EMAIL_USERNAME }}
