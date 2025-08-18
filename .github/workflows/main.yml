@@ -1,35 +1,37 @@
 name: ETF Tracker
 
 on:
-  workflow_dispatch:        # 手動觸發 (Run workflow)
-  schedule:
-    - cron: "0 10 * * *"    # 每天 18:00 (台灣 UTC+8 = 10:00 UTC)
-  push:
-    branches: [ main ]
+  workflow_dispatch:          # 手動觸發
+  schedule:                   # 定時觸發 (每天 18:00 台灣時間 = 10:00 UTC)
+    - cron: "0 10 * * *"
 
 jobs:
-  run:
+  run-etf-tracker:
     runs-on: ubuntu-latest
-    env:
-      EMAIL_TO: ${{ secrets.EMAIL_TO }}
-      EMAIL_USERNAME: ${{ secrets.EMAIL_USERNAME }}
-      SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
-      SENDGRID_FROM: ${{ secrets.SENDGRID_FROM }}
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v3
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v4
         with:
           python-version: "3.10"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-      - name: Run ETF tracker
-        run: python etf_tracker.py
+      - name: Run build_change_table.py
+        run: python build_change_table.py
 
-      - name: Send email report
+      - name: Run charts.py
+        run: python charts.py
+
+      - name: Run send_email.py
+        env:
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          EMAIL_USERNAME: ${{ secrets.EMAIL_USERNAME }}
+          SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
         run: python send_email.py
