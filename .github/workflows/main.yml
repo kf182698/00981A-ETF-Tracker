@@ -3,8 +3,7 @@ name: ETF Tracker
 on:
   workflow_dispatch:        # 手動觸發 (Run workflow)
   schedule:
-    - cron: "0 10 * * *"   # Run every day at 18:00 Taipei time
-  workflow_dispatch:        # 保留手動觸發功能
+    - cron: "0 10 * * *"    # 每天 18:00 (台灣 UTC+8 = 10:00 UTC)
   push:
     branches: [ main ]
 
@@ -31,12 +30,6 @@ jobs:
 
       - name: Run ETF tracker
         run: python etf_tracker.py
-
-      - name: Build change table
-        run: python build_change_table.py
-
-      - name: Generate charts
-        run: python charts.py
 
       - name: Send email report
         run: python send_email.py
