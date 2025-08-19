@@ -1,413 +1,131 @@
-# etf_tracker.py — Selenium 抓取 + 下載穩定偵測 + Excel 解析 + 收盤價寫入
+# etf_tracker.py — 抓取 00981A ETF 每日持股明細，存成 CSV + 原始 Excel
 import os
+import re
 import time
 import glob
-import uuid
-import math
-import random
+import shutil
 from datetime import datetime
+from pathlib import Path
 
 import requests
 import pandas as pd
-
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-import chromedriver_autoinstaller
 
+# ===== 路徑設定 =====
+DOWNLOAD_DIR = "downloads"
+DATA_DIR = "data"
+Path(DOWNLOAD_DIR).mkdir(exist_ok=True)
+Path(DATA_DIR).mkdir(exist_ok=True)
 
-# ========= 基本設定 =========
-TODAY = datetime.today().strftime('%Y-%m-%d')
-# 00981A（EZMoney fundCode=49YTW）
-URL = "https://www.ezmoney.com.tw/ETF/Fund/Info?fundCode=49YTW"
+# ===== ETF 網址（EZMoney 活動頁） =====
+ETF_URL = "https://www.ezmoney.com.tw/events/2025TGA/index.html"
 
-DOWNLOAD_DIR = os.path.abspath("downloads")
-DATA_DIR = os.path.abspath("data")
-SCREEN_DIR = os.path.abspath("screenshots")
+def _latest_downloaded_file(folder):
+    """取下載資料夾內最後生成的檔案路徑"""
+    files = glob.glob(os.path.join(folder, "*"))
+    if not files:
+        return None
+    return max(files, key=os.path.getctime)
 
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(SCREEN_DIR, exist_ok=True)
+def _clean_dataframe(df: pd.DataFrame):
+    """清理 ETF 持股 Excel 轉換成統一格式"""
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
 
+    # 嘗試找出欄位
+    mapping = {}
+    for col in df.columns:
+        if re.search("代號", col):
+            mapping[col] = "股票代號"
+        elif re.search("名稱", col):
+            mapping[col] = "股票名稱"
+        elif re.search("股數", col):
+            mapping[col] = "股數"
+        elif re.search("持股比例|權重|占比", col):
+            mapping[col] = "持股權重"
+        elif re.search("收盤|價格|Close", col, re.IGNORECASE):
+            mapping[col] = "收盤價"
+    df = df.rename(columns=mapping)
 
-def log(msg: str):
-    print(f"[etf_tracker] {msg}", flush=True)
+    need_cols = ["股票代號","股票名稱","股數","持股權重"]
+    for c in need_cols:
+        if c not in df.columns:
+            raise ValueError(f"缺少必要欄位: {c}")
 
+    # 清理數值
+    df["股票代號"] = df["股票代號"].astype(str).str.strip()
+    df["股票名稱"] = df["股票名稱"].astype(str).str.strip()
 
-# ========= 欄位工具 =========
-def _normalize_cols(cols):
-    # 去除全形/半形空白
-    return [str(c).strip().replace("　", "").replace("\u3000", "") for c in cols]
+    df["股數"] = (
+        df["股數"].astype(str).str.replace(",", "", regex=False)
+    )
+    df["股數"] = pd.to_numeric(df["股數"], errors="coerce").fillna(0).astype(int)
 
+    df["持股權重"] = (
+        df["持股權重"].astype(str).str.replace(",", "", regex=False).str.replace("%", "", regex=False)
+    )
+    df["持股權重"] = pd.to_numeric(df["持股權重"], errors="coerce").fillna(0.0)
 
-ALIAS = {
-    "股票代號": ["股票代號", "證券代號", "代號", "證券代號/代碼"],
-    "股票名稱": ["股票名稱", "證券名稱", "名稱"],
-    "股數":     ["股數", "持股股數", "持有股數"],
-    "持股權重": ["持股權重", "持股比例", "權重", "比重(%)", "占比(%)", "占比"]
-}
+    if "收盤價" in df.columns:
+        df["收盤價"] = pd.to_numeric(df["收盤價"], errors="coerce")
 
+    return df[["股票代號","股票名稱","股數","持股權重"] + (["收盤價"] if "收盤價" in df.columns else [])]
 
-def _pick(df: pd.DataFrame, key: str):
-    for cand in ALIAS[key]:
-        if cand in df.columns:
-            return cand
-    return None
+def download_etf_excel():
+    """用 Selenium 模擬下載 ETF Excel"""
+    chrome_options = Options()
+    chrome_options.add_argument("--headless")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    prefs = {"download.default_directory": str(Path(DOWNLOAD_DIR).resolve())}
+    chrome_options.add_experimental_option("prefs", prefs)
 
+    driver = webdriver.Chrome(options=chrome_options)
+    driver.get(ETF_URL)
 
-# ========= 下載等待工具 =========
-def list_crdownload():
     try:
-        return [n for n in os.listdir(DOWNLOAD_DIR) if n.endswith(".crdownload")]
-    except FileNotFoundError:
-        return []
-
-
-def latest_xlsx_path():
-    files = sorted(glob.glob(os.path.join(DOWNLOAD_DIR, "*.xlsx")), key=os.path.getmtime)
-    return files[-1] if files else None
-
-
-def size_stable(path, checks=6, interval=0.8):
-    """檔案大小連續 checks 次未變化即視為穩定"""
-    if not path or not os.path.exists(path):
-        return False
-    last = -1
-    stable = 0
-    for _ in range(checks):
-        sz = os.path.getsize(path)
-        if sz == last and sz > 0:
-            stable += 1
-        else:
-            stable = 0
-        last = sz
-        time.sleep(interval)
-    return stable >= (checks - 1)
-
-
-# ========= 當日收盤價抓取（TWSE RWD + TPEX；含就近回填與重試） =========
-SESSION = requests.Session()
-SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Connection": "keep-alive",
-})
-
-def _to_roc_date(yyyy_mm_dd: str) -> str:
-    y, m, d = yyyy_mm_dd.split("-")
-    roc = int(y) - 1911
-    return f"{roc:03d}/{int(m):02d}/{int(d):02d}"
-
-def _retry(fn, times=3, sleep=0.6):
-    last = None
-    for _ in range(times):
-        try:
-            return fn()
-        except Exception as e:
-            last = e
-            time.sleep(sleep + random.random() * 0.3)
-    if last:
-        raise last
-    return None
-
-def _twse_stock_day(code: str, date_yyyymmdd: str):
-    """
-    TWSE RWD 端點：
-    https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY?date=YYYYMMDD&stockNo=XXXX
-    data 每列：[日期(ROC), 成交股數, 成交金額, 開盤, 最高, 最低, 收盤, 漲跌, 成交筆數]
-    """
-    url = "https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY"
-    params = {"response": "json", "date": date_yyyymmdd, "stockNo": code}
-    def _do():
-        r = SESSION.get(url, params=params, timeout=12)
-        r.raise_for_status()
-        j = r.json()
-        if j.get("stat") != "OK":
-            return None
-        rows = j.get("data", [])
-        if not rows:
-            return None
-        # 若當天沒有列，取該月最後一筆（通常是最近交易日）
-        target_roc = _to_roc_date(f"{date_yyyymmdd[:4]}-{date_yyyymmdd[4:6]}-{date_yyyymmdd[6:]}")
-        candidate = None
-        for row in rows:
-            candidate = row
-            if str(row[0]).strip() == target_roc:
-                break
-        close_str = str(candidate[6]).replace(",", "")
-        return float(close_str)
-    return _retry(_do)
-
-def _tpex_daily(code: str, roc_yyy_mm: str, roc_yyy_mm_dd: str):
-    """
-    TPEX（櫃買）端點（月表）：
-    https://www.tpex.org.tw/www/stock/trading/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d=113/08&stkno=XXXX
-    aaData 每列：[日期, 成交股數, 成交金額, 開盤, 最高, 最低, 收盤, 漲跌, 均價, 成交筆數, ...]
-    """
-    url = "https://www.tpex.org.tw/www/stock/trading/aftertrading/daily_trading_info/st43_result.php"
-    params = {"l": "zh-tw", "d": roc_yyy_mm, "stkno": code}
-    def _do():
-        r = SESSION.get(url, params=params, timeout=12)
-        r.raise_for_status()
-        j = r.json()
-        rows = j.get("aaData") or j.get("data") or []
-        if not rows:
-            return None
-        cand = None
-        for row in rows:
-            cand = row
-            if str(row[0]).strip() == roc_yyy_mm_dd:
-                break
-        close_str = str(cand[6]).replace(",", "")
-        return float(close_str)
-    return _retry(_do)
-
-def fetch_close_price(code: str, ymd: str) -> float | None:
-    """
-    先嘗試 TWSE；失敗再試 TPEX。若目標日無資料則以月內最後一筆回填。
-    """
-    ymd_compact = ymd.replace("-", "")
-    try:
-        c = _twse_stock_day(code, ymd_compact)
-        if c is not None and not math.isnan(c):
-            return round(float(c), 2)
-    except Exception:
-        pass
-    try:
-        roc_date  = _to_roc_date(ymd)  # 113/MM/DD
-        roc_month = roc_date[:7]       # 113/MM
-        c = _tpex_daily(code, roc_month, roc_date)
-        if c is not None and not math.isnan(c):
-            return round(float(c), 2)
-    except Exception:
-        pass
-    return None
-
-
-# ========= 啟動 Chrome (Headless) =========
-chromedriver_autoinstaller.install()
-options = Options()
-options.add_argument("--headless=new")
-options.add_argument("--disable-gpu")
-options.add_argument("--no-sandbox")
-options.add_argument("--disable-dev-shm-usage")
-options.add_argument("--window-size=1280,900")
-# 模擬一般使用者 UA，降低被擋風險
-options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0 Safari/537.36")
-# 降低自動化特徵
-options.add_experimental_option("excludeSwitches", ["enable-automation"])
-options.add_experimental_option("useAutomationExtension", False)
-# 允許自動下載
-options.add_experimental_option("prefs", {
-    "download.default_directory": DOWNLOAD_DIR,
-    "download.prompt_for_download": False,
-    "download.directory_upgrade": True,
-    "safebrowsing.enabled": True
-})
-
-driver = webdriver.Chrome(options=options)
-driver.set_window_size(1280, 900)
-
-# 顯式允許 headless 下載（CDP）
-try:
-    driver.execute_cdp_cmd("Page.setDownloadBehavior", {"behavior": "allow", "downloadPath": DOWNLOAD_DIR})
-except Exception:
-    try:
-        driver.execute_cdp_cmd("Browser.setDownloadBehavior", {"behavior": "allow", "downloadPath": DOWNLOAD_DIR})
-    except Exception:
-        pass
-
-
-def snap(tag: str):
-    """例外時截圖"""
-    path = os.path.join(SCREEN_DIR, f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{tag}_{uuid.uuid4().hex[:6]}.png")
-    try:
-        driver.save_screenshot(path)
-        log(f"Saved screenshot: {path}")
-    except Exception as e:
-        log(f"screenshot failed: {e}")
-
-
-def safe_click(locator, tries=3):
-    """穩定點擊（重試 + JS click）"""
-    last_err = None
-    for _ in range(tries):
-        try:
-            el = WebDriverWait(driver, 12).until(EC.element_to_be_clickable(locator))
-            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-            time.sleep(0.2)
-            driver.execute_script("arguments[0].click();", el)
-            return True
-        except Exception as e:
-            last_err = e
-            time.sleep(1.2)
-    log(f"click failed: {last_err}")
-    return False
-
-
-try:
-    # 1) 開頁
-    log(f"Open page: {URL}")
-    driver.get(URL)
-    WebDriverWait(driver, 25).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-    time.sleep(1)
-
-    # 2) 嘗試點「基金投資組合」分頁
-    for locator in [
-        (By.XPATH, "//*[contains(text(),'基金投資組合')]"),
-        (By.XPATH, "//*[contains(text(),'投資組合')]"),
-    ]:
-        if safe_click(locator, tries=3):
-            log("Clicked tab: 基金投資組合")
-            time.sleep(0.8)
-            break
-
-    # 3) 找「匯出XLSX」按鈕並嘗試下載
-    export_locators = [
-        (By.XPATH, "//a[contains(., 'XLSX')]"),
-        (By.XPATH, "//a[contains(., '匯出')]"),
-        (By.XPATH, "//button[contains(., 'XLSX') or contains(., '匯出')]"),
-        (By.CSS_SELECTOR, "a[href*='Export'][href*='xlsx'], a[href*='XLSX']")
-    ]
-    clicked = False
-    href_fallback = None
-
-    for loc in export_locators:
-        try:
-            btn = WebDriverWait(driver, 12).until(EC.element_to_be_clickable(loc))
-            href_fallback = btn.get_attribute("href")
-            if safe_click(loc, tries=3):
-                clicked = True
-                log("Clicked: 匯出XLSX")
-                break
-        except Exception:
-            continue
-
-    if not clicked:
-        snap("no_export_button")
-        raise RuntimeError("找不到『匯出XLSX』按鈕，請檢查頁面是否改版或權限限制。")
-
-    # 讓下載啟動
-    time.sleep(2)
-
-    # 若無下載活動也無檔案 → 嘗試以 href 直接導向
-    if not list_crdownload() and not latest_xlsx_path() and href_fallback:
-        log("No download detected after click, trying direct href navigation…")
-        driver.get(href_fallback)
-        time.sleep(2)
-
-    # 4) 等待 Excel 下載完成（先等開始 → 再等大小穩定）
-    # 先等「下載啟動」
-    start_deadline = time.time() + 60  # 最多等 60 秒開始
-    while time.time() < start_deadline:
-        crd = list_crdownload()
-        xlsx = latest_xlsx_path()
-        log(f"Downloading… (crdownload={len(crd)}, xlsx={'yes' if xlsx else 'no'})")
-        if crd or xlsx:
-            break
-        time.sleep(1)
-
-    # 再等「完成或大小穩定」
-    xlsx_path = None
-    finish_deadline = time.time() + 180  # 最多再等 180 秒完成
-    while time.time() < finish_deadline:
-        crd = list_crdownload()
-        xlsx = latest_xlsx_path()
-
-        status = f"crdownload={len(crd)}, xlsx={'yes' if xlsx else 'no'}"
-        log(f"Downloading… ({status})")
-
-        # 有 xlsx 檔，且大小穩定，就視為完成
-        if xlsx and size_stable(xlsx, checks=6, interval=0.8):
-            xlsx_path = xlsx
-            break
-
-        time.sleep(1)
-
-    # 最後保險一次：若仍未成功，但有 xlsx 且檔案 > 0，就放行
-    if not xlsx_path:
-        x = latest_xlsx_path()
-        if x and os.path.getsize(x) > 0:
-            log("No perfect finish detected, but XLSX exists with size > 0. Proceeding.")
-            xlsx_path = x
-
-    if not xlsx_path:
-        snap("no_xlsx_detected")
-        raise RuntimeError("未偵測到下載完成的 .xlsx 檔（可能被網站阻擋或按鈕定位失敗）。")
-
-    log(f"Downloaded Excel: {os.path.basename(xlsx_path)}")
-
-    # 5) 解析 Excel：自動定位正確工作表與表頭
-    xls = pd.ExcelFile(xlsx_path, engine="openpyxl")
-    target_df = None
-
-    for sheet in xls.sheet_names:
-        # 無表頭讀入，掃前 30 列找包含股票代號/名稱的表頭列
-        raw = pd.read_excel(xls, sheet_name=sheet, header=None, dtype=str)
-        found_header_row = None
-        for r in range(min(30, len(raw))):
-            row_vals = _normalize_cols(list(raw.iloc[r].fillna("").astype(str)))
-            if any(any(k in cell for k in ALIAS["股票代號"]) for cell in row_vals) and \
-               any(any(k in cell for k in ALIAS["股票名稱"]) for cell in row_vals):
-                found_header_row = r
-                break
-        if found_header_row is None:
-            continue  # 封面或說明頁，跳過
-
-        df_try = pd.read_excel(xls, sheet_name=sheet, header=found_header_row)
-        df_try.columns = _normalize_cols(df_try.columns)
-
-        c_code   = _pick(df_try, "股票代號")
-        c_name   = _pick(df_try, "股票名稱")
-        c_shares = _pick(df_try, "股數")
-        c_weight = _pick(df_try, "持股權重")
-
-        if all([c_code, c_name, c_shares, c_weight]):
-            target_df = df_try[[c_code, c_name, c_shares, c_weight]].copy()
-            target_df.columns = ["股票代號", "股票名稱", "股數", "持股權重"]
-            log(f"Parsed sheet: {sheet} (header row={found_header_row})")
-            break
-
-    if target_df is None:
-        snap("parse_failed")
-        raise KeyError(f"在任何工作表都找不到必要欄位，請手動下載檔案檢查欄名。工作表={xls.sheet_names}")
-
-    # 6) 數值清洗
-    for col in ["股數", "持股權重"]:
-        target_df[col] = (
-            target_df[col].astype(str)
-            .str.replace(",", "", regex=False)
-            .str.replace("%", "", regex=False)
+        # 找「下載 Excel」按鈕
+        dl_btn = WebDriverWait(driver, 20).until(
+            EC.element_to_be_clickable((By.XPATH, "//a[contains(text(), 'Excel') or contains(text(), 'EXCEL')]"))
         )
-    target_df["股數"] = pd.to_numeric(target_df["股數"], errors="coerce")
-    target_df["持股權重"] = pd.to_numeric(target_df["持股權重"], errors="coerce")
+        dl_btn.click()
+        time.sleep(8)  # 等待檔案下載完成
+    except Exception as e:
+        driver.quit()
+        raise RuntimeError(f"下載 Excel 失敗: {e}")
 
-    # 7) 逐檔補上「收盤價」
-    prices = {}
-    for code in target_df["股票代號"].astype(str).str.strip():
-        if not code or not code.isdigit():
-            prices[code] = None
-            continue
-        try:
-            px = fetch_close_price(code, TODAY)
-        except Exception:
-            px = None
-        prices[code] = px
-        log(f"close price {code}: {px}")
-
-    target_df["收盤價"] = target_df["股票代號"].astype(str).map(prices)
-
-    # 8) 輸出 CSV
-    csv_path = os.path.join(DATA_DIR, f"{TODAY}.csv")
-    target_df.to_csv(csv_path, index=False, encoding="utf-8-sig")
-    log(f"Saved CSV: {csv_path}")
-
-except Exception as e:
-    # 發生例外就截圖留證並拋出
-    snap("exception")
-    raise
-finally:
     driver.quit()
-    log("Driver closed.")
+
+    # 找下載好的檔案
+    f = _latest_downloaded_file(DOWNLOAD_DIR)
+    if not f:
+        raise FileNotFoundError("下載資料夾沒有檔案")
+
+    return f
+
+def main():
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    # ===== Step1. 下載 Excel =====
+    raw_excel = download_etf_excel()
+
+    # 固定命名保存一份原始 Excel
+    fixed_excel = os.path.join(DOWNLOAD_DIR, f"{today}.xlsx")
+    shutil.move(raw_excel, fixed_excel)
+    print(f"Saved raw Excel: {fixed_excel}")
+
+    # ===== Step2. 讀取與清洗 =====
+    df = pd.read_excel(fixed_excel)
+    df = _clean_dataframe(df)
+
+    # ===== Step3. 存成 CSV =====
+    csv_out = os.path.join(DATA_DIR, f"{today}.csv")
+    df.to_csv(csv_out, index=False, encoding="utf-8-sig")
+    print(f"Saved cleaned CSV: {csv_out}")
+
+if __name__ == "__main__":
+    main()
