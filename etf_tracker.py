@@ -7,7 +7,6 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 
-import requests
 import pandas as pd
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -21,11 +20,10 @@ DATA_DIR = "data"
 Path(DOWNLOAD_DIR).mkdir(exist_ok=True)
 Path(DATA_DIR).mkdir(exist_ok=True)
 
-# ===== ETF 網址（EZMoney 活動頁） =====
+# ===== ETF 網址（EZMoney 活動頁或你實際使用頁面） =====
 ETF_URL = "https://www.ezmoney.com.tw/events/2025TGA/index.html"
 
 def _latest_downloaded_file(folder):
-    """取下載資料夾內最後生成的檔案路徑"""
     files = glob.glob(os.path.join(folder, "*"))
     if not files:
         return None
@@ -73,12 +71,15 @@ def _clean_dataframe(df: pd.DataFrame):
     if "收盤價" in df.columns:
         df["收盤價"] = pd.to_numeric(df["收盤價"], errors="coerce")
 
-    return df[["股票代號","股票名稱","股數","持股權重"] + (["收盤價"] if "收盤價" in df.columns else [])]
+    cols = ["股票代號","股票名稱","股數","持股權重"]
+    if "收盤價" in df.columns:
+        cols.append("收盤價")
+    return df[cols]
 
 def download_etf_excel():
     """用 Selenium 模擬下載 ETF Excel"""
     chrome_options = Options()
-    chrome_options.add_argument("--headless")
+    chrome_options.add_argument("--headless=new")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     prefs = {"download.default_directory": str(Path(DOWNLOAD_DIR).resolve())}
@@ -88,12 +89,13 @@ def download_etf_excel():
     driver.get(ETF_URL)
 
     try:
-        # 找「下載 Excel」按鈕
+        # 找「下載 Excel」按鈕（依實際頁面調整 XPath/CSS）
         dl_btn = WebDriverWait(driver, 20).until(
             EC.element_to_be_clickable((By.XPATH, "//a[contains(text(), 'Excel') or contains(text(), 'EXCEL')]"))
         )
         dl_btn.click()
-        time.sleep(8)  # 等待檔案下載完成
+        # 等待檔案下載完成
+        time.sleep(8)
     except Exception as e:
         driver.quit()
         raise RuntimeError(f"下載 Excel 失敗: {e}")
@@ -113,19 +115,25 @@ def main():
     # ===== Step1. 下載 Excel =====
     raw_excel = download_etf_excel()
 
-    # 固定命名保存一份原始 Excel
+    # 固定命名保存一份原始 Excel：downloads/YYYY-MM-DD.xlsx
     fixed_excel = os.path.join(DOWNLOAD_DIR, f"{today}.xlsx")
-    shutil.move(raw_excel, fixed_excel)
-    print(f"Saved raw Excel: {fixed_excel}")
+    try:
+        if os.path.exists(fixed_excel):
+            os.remove(fixed_excel)
+        shutil.move(raw_excel, fixed_excel)
+    except Exception as e:
+        print("[etf_tracker] rename failed:", e)
+        fixed_excel = raw_excel  # fallback
+    print(f"[etf_tracker] Saved raw Excel: {fixed_excel}")
 
     # ===== Step2. 讀取與清洗 =====
     df = pd.read_excel(fixed_excel)
     df = _clean_dataframe(df)
 
-    # ===== Step3. 存成 CSV =====
+    # ===== Step3. 存成 CSV（供後續比較）=====
     csv_out = os.path.join(DATA_DIR, f"{today}.csv")
     df.to_csv(csv_out, index=False, encoding="utf-8-sig")
-    print(f"Saved cleaned CSV: {csv_out}")
+    print(f"[etf_tracker] Saved cleaned CSV: {csv_out}")
 
 if __name__ == "__main__":
     main()
