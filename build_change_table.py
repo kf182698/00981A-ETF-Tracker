@@ -4,7 +4,7 @@ import re
 import glob
 import hashlib
 from pathlib import Path
-import pandas as pd  # ← 只在最上方匯入一次
+import pandas as pd
 
 # ===== 共用設定（若無 config.py 則使用預設） =====
 try:
@@ -218,15 +218,19 @@ def main():
     print("Saved:", new_path)
 
     # ===== D5（回溯 5 份快照；不足就近回填；只在今日持股集合上報）=====
+    # 建立回溯日期序列：含 today 在內往前最多 5 份
     back_dates = [d for d in dates if d <= today]
     back_dates = back_dates[-5:]  # 取最後 5 份（含 today）
+    # 不足 5 份，用最早那份回填到 5 份
     while len(back_dates) < 5 and back_dates:
         back_dates.insert(0, back_dates[0])
 
+    # code -> weight 的 panel
     panel = {}
     for d in back_dates:
         df = _read_day(d)
         if df is None:
+            # 回填：用上一個可用
             prev_key = sorted(panel.keys())[-1] if panel else None
             panel[d] = panel[prev_key].copy() if prev_key else {}
             continue
@@ -246,4 +250,10 @@ def main():
         today_codes = set(df_t["股票代號"].astype(str))
         df_d5 = pd.DataFrame({
             "今日%":  w_today.reindex(today_codes).fillna(0.0),
-            "昨日%":  w_yest.reindex(today_codes).fillna(0.0
+            "昨日%":  w_yest.reindex(today_codes).fillna(0.0),
+            "T-5日%": w_t5.reindex(today_codes).fillna(0.0),
+        })
+        name_map = dict(zip(df_t["股票代號"].astype(str), df_t["股票名稱"]))
+        df_d5["股票代號"] = df_d5.index.astype(str)
+        df_d5["股票名稱"] = df_d5["股票代號"].map(name_map).fillna("")
+        df_d5["D1Δ%"] = (df_d5["今日%"] - df_d5["昨日%"]).round(PCT_DECIMALS
