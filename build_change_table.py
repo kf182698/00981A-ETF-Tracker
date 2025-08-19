@@ -2,8 +2,8 @@
 import os
 import re
 import glob
+import hashlib
 from pathlib import Path
-from datetime import datetime
 import pandas as pd
 
 # ===== 共用設定（若無 config.py 則使用預設） =====
@@ -103,6 +103,16 @@ def _read_day(date_str):
 
     return out
 
+def _md5(path):
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def _csv_path(d):
+    return os.path.join(DATA_DIR, f"{d}.csv")
+
 # ===== 主流程 =====
 def main():
     dates = _list_dates_sorted()
@@ -110,21 +120,34 @@ def main():
         print("No data/*.csv found.")
         return
 
-    # 取「最新日期」為 today；prev 為「小於 today 的最大日期」
-    today = max(dates)
+    # 嚴格使用「前一個不同日期」做比較
+    today = max(dates)  # 最新日期（YYYY-MM-DD）
     prev_candidates = [d for d in dates if d < today]
     prev = max(prev_candidates) if prev_candidates else None
 
-    print(f"[build] today={today}, prev={prev}")
+    print(f"[build] pick dates -> today={today}, prev={prev}")
 
     df_t = _read_day(today)
-    df_y = _read_day(prev) if prev else pd.DataFrame(columns=["股票代號","股票名稱","股數","持股權重","收盤價"])
-
     if df_t is None:
         print(f"[build] {today}.csv 格式不符或缺欄位")
         return
-    if df_y is None:
+
+    if prev:
+        df_y = _read_day(prev)
+    else:
         df_y = pd.DataFrame(columns=["股票代號","股票名稱","股數","持股權重","收盤價"])
+
+    # Log 檢查：today/prev 檔案與 MD5
+    p_today = _csv_path(today)
+    p_prev  = _csv_path(prev) if prev else None
+    if os.path.exists(p_today):
+        print(f"[build] today_path={p_today}, md5={_md5(p_today)}")
+    if p_prev and os.path.exists(p_prev):
+        print(f"[build] prev_path={p_prev}, md5={_md5(p_prev)}")
+
+    if not prev or (p_prev and os.path.exists(p_prev) and _md5(p_prev) == _md5(p_today)):
+        print("[build][WARN] prev is missing or equals today snapshot. "
+              "Comparisons may show 0. Ensure data/ has previous trading day.")
 
     # 保險：兩邊代碼都轉字串
     df_t["股票代號"] = df_t["股票代號"].astype(str).str.strip()
@@ -150,7 +173,7 @@ def main():
     # 排序：今日權重 desc、代碼 asc
     df_merge = df_merge.sort_values(["今日權重%","股票代號"], ascending=[False, True])
 
-    # ===== 每日持股變化追蹤表（人眼友善版） =====
+    # ===== 每日持股變化追蹤表（人眼友善版 + meta 列） =====
     out_cols = [
         "股票代號", "股票名稱",
         "股數_今日", "今日權重%",
@@ -166,9 +189,17 @@ def main():
     df_human["今日權重%"] = df_human["今日權重%"].map(_fmt_pct)
     df_human["Δ%"]       = df_human["Δ%"].map(lambda x: _fmt_pct(x))
 
+    # 在 CSV 最前面加 meta 兩列（方便在 Email 快速確認比對基準）
+    import pandas as pd  # 局部引用避免上面陰影
+    meta = pd.DataFrame({
+        "股票代號": [f"BASE_TODAY={today}"],
+        "股票名稱": [f"BASE_PREV={prev or 'N/A'}"],
+    })
+    df_out_with_meta = pd.concat([meta, df_human], ignore_index=True)
+
     csv_out  = os.path.join(REPORT_DIR, f"holdings_change_table_{today}.csv")
     xlsx_out = os.path.join(REPORT_DIR, f"holdings_change_table_{today}.xlsx")
-    df_human.to_csv(csv_out, index=False, encoding="utf-8-sig")
+    df_out_with_meta.to_csv(csv_out, index=False, encoding="utf-8-sig")
     try:
         with pd.ExcelWriter(xlsx_out, engine="openpyxl") as w:
             df_human.to_excel(w, index=False, sheet_name="ChangeTable")
