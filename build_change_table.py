@@ -4,7 +4,7 @@ import re
 import glob
 import hashlib
 from pathlib import Path
-import pandas as pd
+import pandas as pd  # ← 只在最上方匯入一次
 
 # ===== 共用設定（若無 config.py 則使用預設） =====
 try:
@@ -89,12 +89,8 @@ def _read_day(date_str):
     out["股票名稱"] = df[c_name].astype(str).str.strip()
 
     # 數值清洗
-    out["股數"] = (
-        out["股數"].astype(str).str.replace(",", "", regex=False)
-    )
-    out["持股權重"] = (
-        out["持股權重"].astype(str).str.replace(",", "", regex=False).str.replace("%", "", regex=False)
-    )
+    out["股數"] = out["股數"].astype(str).str.replace(",", "", regex=False)
+    out["持股權重"] = out["持股權重"].astype(str).str.replace(",", "", regex=False).str.replace("%", "", regex=False)
     out["股數"] = pd.to_numeric(out["股數"], errors="coerce").fillna(0).astype(int)
     out["持股權重"] = pd.to_numeric(out["持股權重"], errors="coerce").fillna(0.0)
 
@@ -190,7 +186,6 @@ def main():
     df_human["Δ%"]       = df_human["Δ%"].map(lambda x: _fmt_pct(x))
 
     # 在 CSV 最前面加 meta 兩列（方便在 Email 快速確認比對基準）
-    import pandas as pd  # 局部引用避免上面陰影
     meta = pd.DataFrame({
         "股票代號": [f"BASE_TODAY={today}"],
         "股票名稱": [f"BASE_PREV={prev or 'N/A'}"],
@@ -223,19 +218,15 @@ def main():
     print("Saved:", new_path)
 
     # ===== D5（回溯 5 份快照；不足就近回填；只在今日持股集合上報）=====
-    # 建立回溯日期序列：含 today 在內往前最多 5 份
     back_dates = [d for d in dates if d <= today]
     back_dates = back_dates[-5:]  # 取最後 5 份（含 today）
-    # 不足 5 份，用最早那份回填到 5 份
     while len(back_dates) < 5 and back_dates:
         back_dates.insert(0, back_dates[0])
 
-    # code -> weight 的 panel
     panel = {}
     for d in back_dates:
         df = _read_day(d)
         if df is None:
-            # 回填：用上一個可用
             prev_key = sorted(panel.keys())[-1] if panel else None
             panel[d] = panel[prev_key].copy() if prev_key else {}
             continue
@@ -255,33 +246,4 @@ def main():
         today_codes = set(df_t["股票代號"].astype(str))
         df_d5 = pd.DataFrame({
             "今日%":  w_today.reindex(today_codes).fillna(0.0),
-            "昨日%":  w_yest.reindex(today_codes).fillna(0.0),
-            "T-5日%": w_t5.reindex(today_codes).fillna(0.0),
-        })
-        name_map = dict(zip(df_t["股票代號"].astype(str), df_t["股票名稱"]))
-        df_d5["股票代號"] = df_d5.index.astype(str)
-        df_d5["股票名稱"] = df_d5["股票代號"].map(name_map).fillna("")
-        df_d5["D1Δ%"] = (df_d5["今日%"] - df_d5["昨日%"]).round(PCT_DECIMALS)
-        df_d5["D5Δ%"] = (df_d5["今日%"] - df_d5["T-5日%"]).round(PCT_DECIMALS)
-        df_d5 = df_d5[["股票代號","股票名稱","今日%","昨日%","D1Δ%","T-5日%","D5Δ%"]]
-
-        d5_path = os.path.join(REPORT_DIR, f"weights_chg_5d_{today}.csv")
-        df_d5.to_csv(d5_path, index=False, encoding="utf-8-sig")
-        print("Saved:", d5_path)
-    else:
-        print("[build] Skip D5: panel empty")
-
-    # ===== 關鍵賣出警示（今日 ≤ 閾值；昨日 > 閾值；Δ<0）=====
-    sell_mask = (df_merge["今日權重%"] <= float(SELL_ALERT_THRESHOLD)) & \
-                (df_merge["昨日權重%"] >  float(SELL_ALERT_THRESHOLD)) & \
-                (df_merge["Δ%"] < 0)
-    df_sell = df_merge.loc[sell_mask, ["股票代號","股票名稱","昨日權重%","今日權重%","Δ%"]].copy()
-    df_sell = df_sell.sort_values("Δ%")
-    sell_path = os.path.join(REPORT_DIR, f"sell_alerts_{today}.csv")
-    df_sell.to_csv(sell_path, index=False, encoding="utf-8-sig")
-    print("Saved:", sell_path)
-
-    print("Reports saved to:", REPORT_DIR)
-
-if __name__ == "__main__":
-    main()
+            "昨日%":  w_yest.reindex(today_codes).fillna(0.0
