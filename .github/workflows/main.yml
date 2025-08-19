@@ -1,8 +1,8 @@
 name: ETF Tracker
 
 on:
-  workflow_dispatch:          # 手動觸發
-  schedule:                   # 定時觸發 (每天 18:00 台灣時間 = 10:00 UTC)
+  workflow_dispatch:          # 允許手動觸發
+  schedule:                   # 每天 18:00 (台灣時間, UTC+8) => 10:00 UTC
     - cron: "0 10 * * *"
 
 jobs:
@@ -11,10 +11,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: "3.10"
 
@@ -23,15 +23,33 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # 1) 抓取並下載 Excel（會固定存為 downloads/YYYY-MM-DD.xlsx）
+      - name: Run etf_tracker.py
+        run: python etf_tracker.py
+
+      # 1.1) 上傳當天下載的原始 Excel 作為 Artifact（即使流程後面失敗也保留）
+      - name: Upload raw Excel artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ezmoney-xlsx-${{ github.run_number }}
+          path: downloads/*.xlsx
+          if-no-files-found: ignore
+
+      # 2) 產生比較報表（CSV/XLSX）
       - name: Run build_change_table.py
         run: python build_change_table.py
 
+      # 3) 產生圖表
       - name: Run charts.py
         run: python charts.py
 
+      # 4) 寄送 Email（使用 SendGrid）
       - name: Run send_email.py
         env:
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           EMAIL_USERNAME: ${{ secrets.EMAIL_USERNAME }}
           SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
+          SENDGRID_FROM: ${{ secrets.SENDGRID_FROM }}
+          # 可選：LIGHT_EMAIL: "1"  # 測試用，僅寄純文字/不附檔
         run: python send_email.py
