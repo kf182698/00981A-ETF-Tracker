@@ -4,7 +4,14 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from pathlib import Path
 from datetime import datetime
-from config import TOP_N, REPORT_DIR, CHART_DIR, SMOOTH_ROLLING_WINDOW
+
+try:
+    from config import TOP_N, REPORT_DIR, CHART_DIR, SMOOTH_ROLLING_WINDOW
+except Exception:
+    TOP_N = 10
+    REPORT_DIR = "reports"
+    CHART_DIR = "charts"
+    SMOOTH_ROLLING_WINDOW = 3
 
 DATA_DIR = "data"
 Path(CHART_DIR).mkdir(parents=True, exist_ok=True)
