@@ -256,4 +256,27 @@ def main():
         name_map = dict(zip(df_t["股票代號"].astype(str), df_t["股票名稱"]))
         df_d5["股票代號"] = df_d5.index.astype(str)
         df_d5["股票名稱"] = df_d5["股票代號"].map(name_map).fillna("")
-        df_d5["D1Δ%"] = (df_d5["今日%"] - df_d5["昨日%"]).round(PCT_DECIMALS
+        df_d5["D1Δ%"] = (df_d5["今日%"] - df_d5["昨日%"]).round(PCT_DECIMALS)
+        df_d5["D5Δ%"] = (df_d5["今日%"] - df_d5["T-5日%"]).round(PCT_DECIMALS)
+        df_d5 = df_d5[["股票代號","股票名稱","今日%","昨日%","D1Δ%","T-5日%","D5Δ%"]]
+
+        d5_path = os.path.join(REPORT_DIR, f"weights_chg_5d_{today}.csv")
+        df_d5.to_csv(d5_path, index=False, encoding="utf-8-sig")
+        print("Saved:", d5_path)
+    else:
+        print("[build] Skip D5: panel empty")
+
+    # ===== 關鍵賣出警示（今日 ≤ 閾值；昨日 > 閾值；Δ<0）=====
+    sell_mask = (df_merge["今日權重%"] <= float(SELL_ALERT_THRESHOLD)) & \
+                (df_merge["昨日權重%"] >  float(SELL_ALERT_THRESHOLD)) & \
+                (df_merge["Δ%"] < 0)
+    df_sell = df_merge.loc[sell_mask, ["股票代號","股票名稱","昨日權重%","今日權重%","Δ%"]].copy()
+    df_sell = df_sell.sort_values("Δ%")
+    sell_path = os.path.join(REPORT_DIR, f"sell_alerts_{today}.csv")
+    df_sell.to_csv(sell_path, index=False, encoding="utf-8-sig")
+    print("Saved:", sell_path)
+
+    print("Reports saved to:", REPORT_DIR)
+
+if __name__ == "__main__":
+    main()
