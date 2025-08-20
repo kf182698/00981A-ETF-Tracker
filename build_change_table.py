@@ -1,4 +1,4 @@
-# build_change_table.py — 產生每日變化表 + 報表 (D1/D5/首次新增/賣出警示)
+# build_change_table.py — 產生每日變化表 + D1/D5/首次新增/賣出警示，並合併 Close / AvgCost / PL%
 import os
 import re
 import glob
@@ -6,12 +6,12 @@ import hashlib
 from pathlib import Path
 import pandas as pd
 
-# ===== 共用設定（若無 config.py 則使用預設） =====
+# ===== 參數（若有 config.py 則覆蓋）=====
 try:
     from config import (
-        REPORT_DIR,
+        REPORT_DIR,            # 報表輸出資料夾
         NEW_WEIGHT_MIN,        # 首次新增持股權重門檻（%）
-        THRESH_UPDOWN_EPS,     # D1 噪音門檻（百分點，用於摘要顯示）
+        THRESH_UPDOWN_EPS,     # D1 噪音門檻（%）
         SELL_ALERT_THRESHOLD,  # 賣出警示門檻（%）
         PCT_DECIMALS,          # 百分比小數位
     )
@@ -30,9 +30,9 @@ def _normalize_cols(cols):
     return [str(c).strip().replace("　", "").replace("\u3000", "") for c in cols]
 
 ALIAS = {
-    "股票代號": ["股票代號", "證券代號", "代號", "證券代號/代碼", "Code"],
+    "股票代號": ["股票代號", "證券代號", "代號", "Code"],
     "股票名稱": ["股票名稱", "證券名稱", "名稱", "Name"],
-    "股數":     ["股數", "持股股數", "持有股數", "Shares"],
+    "股數":     ["股數", "持股股數", "Shares"],
     "持股權重": ["持股權重", "持股比例", "權重", "占比", "占比(%)", "比重(%)", "Weight"],
     "收盤價":   ["收盤價", "Close", "Price"],
 }
@@ -81,21 +81,21 @@ def _read_day(date_str):
     if not all([c_code, c_name, c_shares, c_weight]):
         return None
 
-    out = df[[c_code, c_name, c_shares, c_weight]].copy()
-    out.columns = ["股票代號", "股票名稱", "股數", "持股權重"]
+    cols = [c_code, c_name, c_shares, c_weight]
+    if c_close:
+        cols.append(c_close)
+    out = df[cols].copy()
+    out.columns = ["股票代號", "股票名稱", "股數", "持股權重"] + (["收盤價"] if c_close else [])
 
-    # 代碼/名稱一律字串（避免 int/str 對不上）
-    out["股票代號"] = df[c_code].astype(str).str.strip()
-    out["股票名稱"] = df[c_name].astype(str).str.strip()
+    # 代碼/名稱一律字串
+    out["股票代號"] = out["股票代號"].astype(str).str.strip()
+    out["股票名稱"] = out["股票名稱"].astype(str).str.strip()
 
     # 數值清洗
-    out["股數"] = out["股數"].astype(str).str.replace(",", "", regex=False)
-    out["持股權重"] = out["持股權重"].astype(str).str.replace(",", "", regex=False).str.replace("%", "", regex=False)
     out["股數"] = pd.to_numeric(out["股數"], errors="coerce").fillna(0).astype(int)
     out["持股權重"] = pd.to_numeric(out["持股權重"], errors="coerce").fillna(0.0)
-
-    if c_close:
-        out["收盤價"] = pd.to_numeric(df[c_close], errors="coerce")
+    if "收盤價" in out.columns:
+        out["收盤價"] = pd.to_numeric(out["收盤價"], errors="coerce")
 
     return out
 
@@ -111,6 +111,9 @@ def _csv_path(d):
 
 # ===== 主流程 =====
 def main():
+    # 延後 import，避免在未使用 ledger 的腳本載入階段出錯
+    from ledger import update_ledgers, load_avg_cost_map
+
     dates = _list_dates_sorted()
     if not dates:
         print("No data/*.csv found.")
@@ -149,41 +152,56 @@ def main():
     df_t["股票代號"] = df_t["股票代號"].astype(str).str.strip()
     df_y["股票代號"] = df_y["股票代號"].astype(str).str.strip()
 
+    # 先更新台帳（用今天的 csv：shares/close）
+    update_ledgers(_csv_path(today), today.replace("-", ""))
+
     # ===== 合併今日/昨日 =====
     key = ["股票代號"]
-    df_merge = pd.merge(df_t, df_y, on=key, how="outer", suffixes=("_今日", "_昨日"))
+    dfm = pd.merge(df_t, df_y, on=key, how="outer", suffixes=("_今日", "_昨日"))
     # 名稱以今日優先
-    df_merge["股票名稱"] = df_merge["股票名稱_今日"].fillna(df_merge["股票名稱_昨日"])
+    dfm["股票名稱"] = dfm["股票名稱_今日"].fillna(dfm["股票名稱_昨日"])
 
     # 數值補齊
-    for col in ["股數_今日","股數_昨日","持股權重_今日","持股權重_昨日"]:
-        if col in df_merge.columns:
-            df_merge[col] = pd.to_numeric(df_merge[col], errors="coerce").fillna(0)
+    for col in ["股數_今日","股數_昨日","持股權重_今日","持股權重_昨日","收盤價_今日","收盤價_昨日"]:
+        if col in dfm.columns:
+            dfm[col] = pd.to_numeric(dfm[col], errors="coerce").fillna(0)
 
     # 指標計算
-    df_merge["買賣超股數"] = (df_merge["股數_今日"] - df_merge["股數_昨日"]).astype(int)
-    df_merge["昨日權重%"]  = df_merge["持股權重_昨日"]
-    df_merge["今日權重%"]  = df_merge["持股權重_今日"]
-    df_merge["Δ%"]        = (df_merge["今日權重%"] - df_merge["昨日權重%"]).round(PCT_DECIMALS)
+    dfm["買賣超股數"] = (dfm["股數_今日"] - dfm["股數_昨日"]).astype(int)
+    dfm["昨日權重%"]  = dfm["持股權重_昨日"]
+    dfm["今日權重%"]  = dfm["持股權重_今日"]
+    dfm["Δ%"]        = (dfm["今日權重%"] - dfm["昨日權重%"]).round(PCT_DECIMALS)
+
+    # 今日收盤價優先，缺則用昨日價
+    dfm["Close"] = dfm["收盤價_今日"].where(dfm["收盤價_今日"] > 0, dfm["收盤價_昨日"])
+
+    # 加上 Avg Cost 與 PL%
+    avg_map = load_avg_cost_map()  # {code: avg_cost}
+    dfm["AvgCost"] = dfm["股票代號"].map(avg_map).fillna(0.0)
+    dfm["PL%"] = ((dfm["Close"] / dfm["AvgCost"] - 1.0) * 100.0).where(dfm["AvgCost"] > 0, None)
 
     # 排序：今日權重 desc、代碼 asc
-    df_merge = df_merge.sort_values(["今日權重%","股票代號"], ascending=[False, True])
+    dfm = dfm.sort_values(["今日權重%","股票代號"], ascending=[False, True])
 
     # ===== 每日持股變化追蹤表（人眼友善版 + meta 列） =====
     out_cols = [
         "股票代號", "股票名稱",
         "股數_今日", "今日權重%",
         "股數_昨日", "昨日權重%",
-        "買賣超股數", "Δ%"
+        "買賣超股數", "Δ%",
+        "Close", "AvgCost", "PL%",
     ]
-    df_table = df_merge[out_cols].copy()
+    df_table = dfm[out_cols].copy()
 
     df_human = df_table.copy()
     df_human["股數_今日"] = df_human["股數_今日"].map(_fmt_int)
     df_human["股數_昨日"] = df_human["股數_昨日"].map(_fmt_int)
     df_human["昨日權重%"] = df_human["昨日權重%"].map(_fmt_pct)
     df_human["今日權重%"] = df_human["今日權重%"].map(_fmt_pct)
-    df_human["Δ%"]       = df_human["Δ%"].map(lambda x: _fmt_pct(x))
+    df_human["Δ%"]       = df_human["Δ%"].map(_fmt_pct)
+    df_human["Close"]    = df_human["Close"].map(lambda v: f"{v:.2f}" if pd.notna(v) and v != 0 else "-")
+    df_human["AvgCost"]  = df_human["AvgCost"].map(lambda v: f"{v:.2f}" if v and v > 0 else "-")
+    df_human["PL%"]      = df_human["PL%"].map(lambda v: f"{v:.2f}%" if pd.notna(v) else "-")
 
     # 在 CSV 最前面加 meta 兩列（方便在 Email 快速確認比對基準）
     meta = pd.DataFrame({
@@ -211,26 +229,22 @@ def main():
 
     # ===== 首次新增持股（昨日 ~ 0；今日 >= 門檻） =====
     EPS = 1e-6
-    new_mask = (df_merge["昨日權重%"].fillna(0) <= EPS) & (df_merge["今日權重%"] >= float(NEW_WEIGHT_MIN))
-    df_new = df_merge.loc[new_mask, ["股票代號","股票名稱","今日權重%"]].sort_values("今日權重%", ascending=False)
+    new_mask = (dfm["昨日權重%"].fillna(0) <= EPS) & (dfm["今日權重%"] >= float(NEW_WEIGHT_MIN))
+    df_new = dfm.loc[new_mask, ["股票代號","股票名稱","今日權重%","Close"]].sort_values("今日權重%", ascending=False)
     new_path = os.path.join(REPORT_DIR, f"new_gt_{str(NEW_WEIGHT_MIN).replace('.','p')}_{today}.csv")
     df_new.to_csv(new_path, index=False, encoding="utf-8-sig")
     print("Saved:", new_path)
 
     # ===== D5（回溯 5 份快照；不足就近回填；只在今日持股集合上報）=====
-    # 建立回溯日期序列：含 today 在內往前最多 5 份
     back_dates = [d for d in dates if d <= today]
     back_dates = back_dates[-5:]  # 取最後 5 份（含 today）
-    # 不足 5 份，用最早那份回填到 5 份
     while len(back_dates) < 5 and back_dates:
         back_dates.insert(0, back_dates[0])
 
-    # code -> weight 的 panel
     panel = {}
     for d in back_dates:
         df = _read_day(d)
         if df is None:
-            # 回填：用上一個可用
             prev_key = sorted(panel.keys())[-1] if panel else None
             panel[d] = panel[prev_key].copy() if prev_key else {}
             continue
@@ -267,10 +281,10 @@ def main():
         print("[build] Skip D5: panel empty")
 
     # ===== 關鍵賣出警示（今日 ≤ 閾值；昨日 > 閾值；Δ<0）=====
-    sell_mask = (df_merge["今日權重%"] <= float(SELL_ALERT_THRESHOLD)) & \
-                (df_merge["昨日權重%"] >  float(SELL_ALERT_THRESHOLD)) & \
-                (df_merge["Δ%"] < 0)
-    df_sell = df_merge.loc[sell_mask, ["股票代號","股票名稱","昨日權重%","今日權重%","Δ%"]].copy()
+    sell_mask = (dfm["今日權重%"] <= float(SELL_ALERT_THRESHOLD)) & \
+                (dfm["昨日權重%"] >  float(SELL_ALERT_THRESHOLD)) & \
+                (dfm["Δ%"] < 0)
+    df_sell = dfm.loc[sell_mask, ["股票代號","股票名稱","昨日權重%","今日權重%","Δ%","Close"]].copy()
     df_sell = df_sell.sort_values("Δ%")
     sell_path = os.path.join(REPORT_DIR, f"sell_alerts_{today}.csv")
     df_sell.to_csv(sell_path, index=False, encoding="utf-8-sig")
