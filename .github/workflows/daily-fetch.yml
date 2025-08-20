@@ -1,5 +1,5 @@
 name: Daily Snapshot Fetch
-
+ 
 on:
   schedule:
     - cron: '0 10 * * 1-5'   # 台北 18:00 (UTC+8) = 10:00 UTC，週一~週五
