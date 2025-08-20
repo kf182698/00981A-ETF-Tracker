@@ -1,4 +1,4 @@
-# charts.py (auto-build summary if missing)
+# charts.py (auto-convert CSV & auto-build summary if missing)
 # 1) D1 Weight Change (Top Movers) — barh
 # 2) Daily Weight Trend (Top Movers x5) — smoothed line
 # 3) Weekly Cumulative Weight Change (vs first week)
@@ -16,6 +16,7 @@ import matplotlib.pyplot as plt
 REPORT_DIR = Path("reports")
 CHART_DIR = Path("charts")
 DATA_DIR = Path("data")
+DL_DIR = Path("downloads")
 CHART_DIR.mkdir(parents=True, exist_ok=True)
 
 def _latest_date():
@@ -36,21 +37,45 @@ def _normalize_report_date(s: str) -> str:
         return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
     raise ValueError(f"Cannot parse REPORT_DATE: {s}")
 
+def _ensure_csv(date_str: str):
+    """If data/{date}.csv missing, try convert from downloads xlsx automatically."""
+    csv_path = DATA_DIR / f"{date_str}.csv"
+    if csv_path.exists():
+        return
+    # 找 downloads/{YYYY-MM-DD}.xlsx
+    xlsx_candidates = []
+    p1 = DL_DIR / f"{date_str}.xlsx"
+    if p1.exists():
+        xlsx_candidates.append(p1)
+    # 找 downloads/*{yyyymmdd}*.xlsx
+    yyyymmdd = date_str.replace("-", "")
+    xlsx_candidates += [Path(p) for p in glob.glob(str(DL_DIR / f"*{yyyymmdd}*.xlsx"))]
+    xlsx_candidates = [p for p in xlsx_candidates if p.exists()]
+
+    if not xlsx_candidates:
+        raise FileNotFoundError(
+            f"missing {csv_path} 且找不到對應 xlsx。\n"
+            f"請先轉檔：python xlsx_to_csv.py --date {date_str}"
+        )
+    # 有 xlsx → 自動轉
+    env = os.environ.copy()
+    print(f"[charts] CSV missing, auto convert from XLSX → data/{date_str}.csv")
+    subprocess.check_call(["python", "xlsx_to_csv.py", "--date", date_str], env=env)
+    if not csv_path.exists():
+        raise FileNotFoundError(f"轉檔後仍無 {csv_path}")
+
 def _load_summary(date_str):
     with open(REPORT_DIR / f"summary_{date_str}.json", "r", encoding="utf-8") as f:
         return json.load(f)
 
 def _ensure_summary(date_str: str):
-    """If summary missing, try to build it by calling build_change_table.py with REPORT_DATE."""
+    """If summary missing, build it by calling build_change_table.py (will use data/{date}.csv)."""
     sum_path = REPORT_DIR / f"summary_{date_str}.json"
     if sum_path.exists():
         return
-    # 需要 data/{date}.csv 才能建
-    csv_path = DATA_DIR / f"{date_str}.csv"
-    if not csv_path.exists():
-        raise FileNotFoundError(f"missing {csv_path}，請先：python xlsx_to_csv.py --date {date_str}")
+    _ensure_csv(date_str)
     env = os.environ.copy()
-    env["REPORT_DATE"] = date_str  # 傳標準日期進去，build 內也支援非標準
+    env["REPORT_DATE"] = date_str  # 傳標準日期進去
     print(f"[charts] summary missing, auto build via build_change_table.py for {date_str} …")
     subprocess.check_call(["python", "build_change_table.py"], env=env)
     if not sum_path.exists():
@@ -149,10 +174,7 @@ def fig_weekly_cum(date_str, summary):
 def main():
     raw = os.getenv("REPORT_DATE")
     date_str = _normalize_report_date(raw) if raw else _latest_date()
-
-    # auto-build summary if missing
-    _ensure_summary(date_str)
-
+    _ensure_summary(date_str)   # 自動補 CSV / 補 summary
     summary = _load_summary(date_str)
     p1 = fig_d1_bars(date_str, summary)
     p2 = fig_daily_trend(date_str, summary)
