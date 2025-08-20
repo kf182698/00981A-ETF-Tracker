@@ -1,21 +1,20 @@
-name: Build Reports & Email
+name: 00981A Daily Tracker
 
 on:
-  workflow_run:
-    workflows: ["Daily Snapshot Fetch"]
-    types: [completed]
+  schedule:
+    # 台北 18:00 (UTC+8) = 10:00 UTC；週一~週五
+    - cron: '0 10 * * 1-5'
   workflow_dispatch: {}
 
 permissions:
   contents: read
 
 concurrency:
-  group: build-and-email
+  group: daily-tracker
   cancel-in-progress: false
 
 jobs:
-  build:
-    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+  run:
     runs-on: ubuntu-latest
     env:
       TZ: Asia/Taipei
@@ -28,24 +27,18 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install -U pip
-          pip install pandas openpyxl matplotlib sendgrid selenium
+          pip install selenium pandas openpyxl matplotlib sendgrid
 
-      # 下載最新的 snapshot artifact
-      - name: Download latest snapshot artifact
-        uses: dawidd6/action-download-artifact@v3
-        with:
-          workflow: Daily Snapshot Fetch
-          workflow_conclusion: success
-          search_artifacts: true
-          name_is_regexp: true
-          # 下載最後一個成功工作流的最後一個 artifact（名稱如 snapshot-YYYY-MM-DD）
-          name: snapshot-.*
-          path: downloads
+      # 1) 抓 EZMoney 的 XLSX 快照 -> downloads/YYYY-MM-DD.xlsx
+      - name: Fetch snapshot (XLSX)
+        run: |
+          python fetch_snapshot.py
 
-      - name: Detect snapshot date
+      # 2) 解析剛抓到的日期，傳給後續步驟
+      - name: Resolve snapshot date
         id: meta
         run: |
           set -e
@@ -53,35 +46,48 @@ jobs:
           BASE=$(basename "$LATEST")
           DATE="${BASE%.xlsx}"
           echo "date=$DATE" >> "$GITHUB_OUTPUT"
-          echo "Using snapshot date: $DATE"
+          echo "[main] snapshot date = $DATE"
 
+      # 3) 轉 CSV（若你想簡化可移除此步；分析也可直接吃 XLSX）
       - name: Convert XLSX -> CSV
         run: |
           python xlsx_to_csv.py --date "${{ steps.meta.outputs.date }}"
 
+      # 4) 產變化表（D1/D5/首次新增/賣出警示等）
       - name: Build change table
         run: |
           python build_change_table.py
 
+      # 5) 產圖（若缺圖 send_email 也會嘗試補產，但建議先畫好）
       - name: Make charts
         run: |
           REPORT_DATE=${{ steps.meta.outputs.date }} python charts.py
 
+      # 6) 寄信（使用 SendGrid）
       - name: Send email
         env:
           EMAIL_USERNAME: ${{ secrets.EMAIL_USERNAME }}
-          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          EMAIL_TO:       ${{ secrets.EMAIL_TO }}
           SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
-          REPORT_DATE: ${{ steps.meta.outputs.date }}
+          REPORT_DATE:    ${{ steps.meta.outputs.date }}
         run: |
           python send_email.py
+
+      # 7) 上傳 artifacts（downloads 與報表/圖表）
+      - name: Upload XLSX artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: downloads-${{ steps.meta.outputs.date }}
+          path: downloads/*.xlsx
+          if-no-files-found: ignore
+          retention-days: 90
 
       - name: Upload reports & charts
         uses: actions/upload-artifact@v4
         with:
-          name: reports-${{ steps.meta.outputs.date }}
+          name: reports-charts-${{ steps.meta.outputs.date }}
           path: |
             reports/*
             charts/*
           if-no-files-found: ignore
-          retention-days: 14
+          retention-days: 90
