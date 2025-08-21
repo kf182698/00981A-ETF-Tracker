@@ -4,5 +4,4 @@ openpyxl
 chromedriver-autoinstaller
 matplotlib
 requests
-openpyxl
 sendgrid==6.11.0
