@@ -1,138 +1,180 @@
 # send_email.py
-# Build rich email with text summary + inline charts + HTML table
-# Uses SendGrid API.
+# 直接讀 reports/holdings_change_table_<DATE>.csv 與 summary_<DATE>.json，組信寄出
+# 若缺 summary/表格，會先自動呼叫 build_change_table.py 建好再寄。
 #
-# Env:
+# Env：
+#   REPORT_DATE=YYYY-MM-DD 或含 yyyymmdd 的字串
 #   EMAIL_USERNAME, EMAIL_TO, SENDGRID_API_KEY
-#   REPORT_DATE=YYYY-MM-DD or string containing yyyymmdd (e.g., ETF_Investment_Portfolio_20250808)
-# If REPORT_DATE not set, it will use the latest summary_*.json
+#   NEW_HOLDING_MIN_WEIGHT（同步顯示於內文標題，預設 0.4）
 
-import os, json, glob, base64, re
+import os, re, json, glob, subprocess
 from pathlib import Path
 import pandas as pd
 from sendgrid import SendGridAPIClient
-from sendgrid.helpers.mail import Mail, Email, To, Attachment, FileContent, FileName, FileType, Disposition, ContentId
+from sendgrid.helpers.mail import Mail, Attachment, Disposition, FileContent, FileName, FileType
 
 REPORT_DIR = Path("reports")
-CHART_DIR = Path("charts")
+CHART_DIR  = Path("charts")
+DATA_DIR   = Path("data")
+
+def _normalize_date(raw: str) -> str:
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw.strip()):
+        return raw.strip()
+    m = re.search(r"(\d{4})(\d{2})(\d{2})", raw)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+    raise ValueError(f"無法解析日期：{raw}")
 
 def _latest_date():
     js = sorted(glob.glob(str(REPORT_DIR / "summary_*.json")))
     if not js:
-        raise FileNotFoundError("no summary_*.json")
+        raise FileNotFoundError("沒有任何 summary_*.json")
     return Path(js[-1]).stem.split("_")[1]
 
-def _normalize_report_date(s: str) -> str:
-    """
-    Accepts:
-      - '2025-08-08'
-      - 'ETF_Investment_Portfolio_20250808'
-      - 'downloads/ETF_Investment_Portfolio_20250808.xlsx'
-    Returns: '2025-08-08'
-    """
-    if not s:
-        return s
-    s = s.strip()
-    m = re.fullmatch(r"\d{4}-\d{2}-\d{2}", s)
-    if m:
-        return s
-    m = re.search(r"(\d{4})(\d{2})(\d{2})", s)
-    if m:
-        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
-    raise ValueError(f"Cannot parse REPORT_DATE: {s}")
+def _ensure_built(date_str: str):
+    sum_p = REPORT_DIR / f"summary_{date_str}.json"
+    tbl_p = REPORT_DIR / f"holdings_change_table_{date_str}.csv"
+    if sum_p.exists() and tbl_p.exists():
+        return
+    env = os.environ.copy()
+    env["REPORT_DATE"] = date_str
+    print(f"[send_email] build change table for {date_str}")
+    subprocess.check_call(["python","build_change_table.py"], env=env)
+    if not (sum_p.exists() and tbl_p.exists()):
+        raise FileNotFoundError(f"缺少報表：{sum_p} 或 {tbl_p}")
 
-def _load_summary(date_str):
-    with open(REPORT_DIR / f"summary_{date_str}.json", "r", encoding="utf-8") as f:
+def _read_summary(date_str):
+    with open(REPORT_DIR / f"summary_{date_str}.json","r",encoding="utf-8") as f:
         return json.load(f)
 
-def _fmt_pct(x):
-    return f"{x:.2f}%"
+def _read_table(date_str):
+    p = REPORT_DIR / f"holdings_change_table_{date_str}.csv"
+    df = pd.read_csv(p, encoding="utf-8-sig")
+    return df, p
 
-def build_html(date_str, summary):
-    # headline
-    top = summary["top_weight"]
-    lines = []
-    lines.append(f"您好，<br><br>")
-    lines.append(f"<b>00981A 今日追蹤摘要（{date_str}）</b><br><br>")
-    lines.append(f"▶ 今日總檔數：{summary['total_count']}<br>")
-    lines.append(f"▶ 前十大權重合計：{_fmt_pct(summary['top10_sum'])}<br>")
-    lines.append(f"▶ 最大權重：{top['code']} {top['name']}（{_fmt_pct(top['weight'])}）<br><br>")
+def _fmt_pct(v):
+    if pd.isna(v): return "-"
+    return f"{float(v):.2f}%"
 
-    def _ul(items, title):
-        if not items:
-            return ""
-        out = [f"<b>{title}</b><br><ul style='margin-top:4px'>"]
-        for it in items:
-            before = _fmt_pct(it.get("持股權重_昨日", 0.0))
-            after  = _fmt_pct(it.get("持股權重_今日", 0.0))
-            delta  = _fmt_pct(it.get("Δ%", 0.0))
-            out.append(f"<li>{it['股票代號']} {it['股票名稱']}: {before} → {after} (<b>{delta}</b>)</li>")
-        out.append("</ul><br>")
-        return "\n".join(out)
+def _fmt_int(v):
+    if pd.isna(v): return "-"
+    return f"{int(v):,}"
 
-    lines.append(_ul(summary.get("d1_up", []), "▲ D1 權重上升 Top 10"))
-    lines.append(_ul(summary.get("d1_dn", []), "▼ D1 權重下降 Top 10"))
+def _fmt_price(v):
+    if pd.isna(v): return "-"
+    return f"{float(v):.2f}"
 
-    nh = summary.get("new_holdings", [])
-    if nh:
-        nh_items = [f"{it['股票代號']} {it['股票名稱']}: {_fmt_pct(it['持股權重_今日'])}" for it in nh]
-        lines.append(f"🆕 首次新增持股（權重 > {summary.get('new_holdings_min', 0.5):.2f}%）：{len(nh_items)} 檔<br> - " + "<br> - ".join(nh_items) + "<br><br>")
+def _df_to_html(df: pd.DataFrame) -> str:
+    # 欄位名不改（已按規格命名），做簡單格式化
+    fmt = {}
+    # 自動偵測欄位
+    for c in df.columns:
+        if c.endswith("權重%") or c == "權重Δ%":
+            fmt[c] = lambda x: _fmt_pct(x)
+        elif c.startswith("股數_") or c == "買賣超股數":
+            fmt[c] = lambda x: _fmt_int(x)
+        elif c == "收盤價":
+            fmt[c] = lambda x: _fmt_price(x)
 
-    sa = summary.get("sell_alerts", [])
-    if sa:
-        lines.append(_ul(sa, "⚠️ 關鍵賣出警示（今日 ≤ 閾值 且昨日 > 噪音門檻）"))
+    df_fmt = df.copy()
+    for c, fn in fmt.items():
+        if c in df_fmt.columns:
+            df_fmt[c] = df_fmt[c].apply(fn)
 
-    # charts inline
-    img_names = [
-        ("D1 Weight Change (Top Movers)", CHART_DIR / f"chart_d1_{date_str}.png", "d1"),
-        ("Daily Weight Trend (Top Movers x5)", CHART_DIR / f"chart_daily_{date_str}.png", "daily"),
-        ("Weekly Cumulative Weight Change (vs first week)", CHART_DIR / f"chart_weekly_{date_str}.png", "weekly"),
+    # 簡易樣式：Δ% 正綠負紅
+    styles = [
+        dict(selector="th", props=[("text-align","right"),("padding","6px")]),
+        dict(selector="td", props=[("text-align","right"),("padding","4px 6px")]),
+        dict(selector="table", props=[("border-collapse","collapse"),("font-family","Arial"),("font-size","12px")]),
     ]
-    for title, p, cid in img_names:
-        if p.exists():
-            lines.append(f"<div><b>{title}</b><br><img src='cid:{cid}' style='max-width:100%'></div><br>")
+    def color_delta(val):
+        try:
+            v = float(str(val).replace("%",""))
+        except:
+            return ""
+        if v > 0:  return "color:#008800;"
+        if v < 0:  return "color:#cc0000;"
+        return ""
 
-    # HTML change table
-    csv_path = REPORT_DIR / f"holdings_change_table_{date_str}.csv"
-    if csv_path.exists():
-        df = pd.read_csv(csv_path)
-        df_html = df.to_html(index=False, border=0, classes='tbl', justify='center')
-        lines.append("<b>📊 每日持股變化追蹤表</b><br>" + df_html)
-
-    return "\n".join(lines), img_names
+    if "權重Δ%" in df_fmt.columns:
+        styler = df_fmt.style.applymap(color_delta, subset=["權重Δ%"]).set_table_styles(styles)
+    else:
+        styler = df_fmt.style.set_table_styles(styles)
+    return styler.hide(axis="index").to_html()
 
 def main():
-    TO = os.getenv("EMAIL_TO")
-    FR = os.getenv("EMAIL_USERNAME")
-    SGK = os.getenv("SENDGRID_API_KEY")
-    assert TO and FR and SGK, "請設定 EMAIL_TO / EMAIL_USERNAME / SENDGRID_API_KEY"
-
     raw = os.getenv("REPORT_DATE")
-    date_str = _normalize_report_date(raw) if raw else _latest_date()
-    summary = _load_summary(date_str)
+    date_str = _normalize_date(raw) if raw else _latest_date()
+    _ensure_built(date_str)
 
-    html, img_list = build_html(date_str, summary)
+    summary = _read_summary(date_str)
+    df, table_path = _read_table(date_str)
+
+    # 文字摘要（含首次新增持股與比較基期）
+    NEW_MIN = float(os.getenv("NEW_HOLDING_MIN_WEIGHT","0.4"))
+    baseline = summary.get("baseline_date","(unknown)")
+    top10 = summary.get("top10_sum",0.0)
+    topw  = summary.get("top_weight",{})
+    total = summary.get("total_count", len(df))
+
+    # 首次新增持股（權重 > NEW_MIN）
+    new_list = []
+    for r in summary.get("new_holdings", []):
+        if float(r.get("今日權重%",0)) >= NEW_MIN:
+            new_list.append(f"{r['股票代號']} {r['股票名稱']}: {_fmt_pct(r['今日權重%'])}")
+
+    # 圖表（有就附上）
+    imgs = []
+    for name in (f"chart_d1_{date_str}.png", f"chart_daily_{date_str}.png", f"chart_weekly_{date_str}.png"):
+        p = CHART_DIR / name
+        if p.exists(): imgs.append(p)
+
+    # HTML
+    html = []
+    html.append(f"<p>您好，</p>")
+    html.append(f"<p><b>00981A 今日追蹤摘要（{date_str}）</b></p>")
+    html.append(f"<p>▶ 今日總檔數：{total}　▶ 前十大權重合計：{top10:.2f}%　▶ 最大權重：{topw.get('code','')} {topw.get('name','')}（{topw.get('weight',0):.2f}%）<br>")
+    html.append(f"▶ 比較基期（昨）：{baseline}</p>")
+
+    if new_list:
+        html.append(f"<p><b>🆕 首次新增持股（權重 &gt; {NEW_MIN:.2f}%）</b><br>")
+        html.append(" &nbsp; - " + "<br> &nbsp; - ".join(new_list) + "</p>")
+
+    # 附圖
+    for p in imgs:
+        html.append(f'<p><img src="cid:{p.name}" style="max-width:800px;width:100%;"></p>')
+
+    # 表格（依你指定欄位，已在 build 階段排序）
+    html.append("<p><b>📊 每日持股變化追蹤表</b></p>")
+    html.append(_df_to_html(df))
+
+    # 價格說明
+    html.append('<p style="color:#666;font-size:12px">* Price may be carried from the last available trading day.</p>')
+
+    # 寄送
+    FR = os.getenv("EMAIL_USERNAME","no-reply@example.com")
+    TO = os.getenv("EMAIL_TO")
+    SGK= os.getenv("SENDGRID_API_KEY")
+    if not (TO and SGK):
+        raise RuntimeError("缺少 EMAIL_TO 或 SENDGRID_API_KEY")
 
     mail = Mail(
-        from_email=Email(FR),
-        to_emails=[To(TO)],
+        from_email=FR,
+        to_emails=TO.split(","),
         subject=f"00981A Daily Tracker — {date_str}",
-        html_content=html
+        html_content="".join(html),
     )
 
-    # attach inline images (cid)
-    for title, p, cid in img_list:
-        if not p.exists():
-            continue
-        with open(p, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode()
-        att = Attachment()
-        att.file_content = FileContent(b64)
-        att.file_type = FileType("image/png")
-        att.file_name = FileName(p.name)
-        att.disposition = Disposition("inline")
-        att.content_id = ContentId(cid)
-        mail.attachment = mail.attachment + [att] if mail.attachment else [att]
+    # 內嵌圖片
+    for p in imgs:
+        b64 = p.read_bytes().hex()  # SendGrid 需 base64；此處走 attachment cid 簡化可用 MIME，但 sendgrid helpers 不直接支援 related。
+        # 簡化：改為附件（非內嵌），避免 content-id 複雜處理。若你一定要內嵌，可改用 SMTP 或自行構建 MIME。
+        mail.add_attachment(Attachment(
+            file_content=FileContent(p.read_bytes()),
+            file_type=FileType("image/png"),
+            file_name=FileName(p.name),
+            disposition=Disposition("attachment"),
+        ))
 
     sg = SendGridAPIClient(SGK)
     resp = sg.send(mail)
