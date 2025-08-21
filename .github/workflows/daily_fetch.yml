@@ -1,0 +1,65 @@
+name: Daily Fetch (00981A raw snapshot)
+
+on:
+  schedule:
+    # 台北 20:00 = UTC 12:00
+    - cron: "0 12 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TZ: Asia/Taipei
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install minimal deps
+        run: |
+          python -m pip install -U pip
+          # 只裝抓檔會用到的套件（穩定、安裝快）
+          pip install selenium pandas openpyxl chromedriver-autoinstaller requests
+
+      - name: Run fetcher (download -> csv)
+        # 只做下載與轉存，其他都先不跑
+        run: |
+          python etf_tracker.py
+
+      - name: Ensure archive folder & copy XLSX
+        run: |
+          mkdir -p archive/$(date +%Y-%m)
+          # 把今天的 xlsx 也歸檔（若檔名不同可多一個備份 copy）
+          YMD=$(date +%F)
+          if [ -f downloads/${YMD}.xlsx ]; then
+            cp downloads/${YMD}.xlsx archive/$(date +%Y-%m)/ETF_Investment_Portfolio_$(date +%Y%m%d).xlsx
+          fi
+
+      - name: Commit & push raw snapshot
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/ downloads/ archive/ prices/ || true
+          git diff --cached --quiet || git commit -m "Daily raw snapshot: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          git push
+
+      - name: Upload artifacts (backup)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-${{ github.run_id }}
+          path: |
+            data/*.csv
+            downloads/*.xlsx
+          if-no-files-found: ignore
