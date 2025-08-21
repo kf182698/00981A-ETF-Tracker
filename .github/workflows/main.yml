@@ -3,50 +3,68 @@ name: Build and Mail
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 12 * * 1-5" # 平日台北時間晚上8點 (12:00 UTC)
+    # 平日台北時間 20:00 (UTC 12:00)
+    - cron: "0 12 * * 1-5"
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      TZ: Asia/Taipei
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: "3.10"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install selenium pandas openpyxl matplotlib sendgrid
+          fi
 
-      # Step 1: 抓取當日 ETF 投資組合 XLSX
+      # 1) 抓取當日 ETF 投資組合 XLSX
       - name: Fetch snapshot (XLSX)
         run: python fetch_snapshot.py
 
-      # Step 2: 解析 XLSX 檔名 → 抽出日期
+      # 2) 解析 XLSX 檔名 → 抽出日期，傳遞給後續步驟
       - name: Resolve snapshot date
         id: meta
+        shell: bash
         run: |
+          set -e
           latest_file=$(ls -t downloads/*.xlsx | head -n 1)
-          date_str=$(basename "$latest_file" .xlsx | sed 's/^ETF_Investment_Portfolio_//')
+          base=$(basename "$latest_file" .xlsx)
+          # 支援兩種命名：YYYY-MM-DD.xlsx 或 ETF_Investment_Portfolio_yyyymmdd.xlsx
+          if [[ "$base" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            date_str="$base"
+          else
+            # 擷取 yyyymmdd -> yyyy-mm-dd
+            ymd=$(echo "$base" | grep -oE '[0-9]{8}' | tail -n1)
+            date_str="${ymd:0:4}-${ymd:4:2}-${ymd:6:2}"
+          fi
           echo "[main] snapshot date = $date_str"
-          echo "date=$date_str" >> $GITHUB_OUTPUT
+          echo "date=$date_str" >> "$GITHUB_OUTPUT"
 
-      # Step 3: 產生變動摘要 JSON
+      # 3) 產生變動摘要 JSON/CSV（強制使用同一個 REPORT_DATE）
       - name: Build change table
         env:
           REPORT_DATE: ${{ steps.meta.outputs.date }}
         run: python build_change_table.py
 
-      # Step 4: 產生圖表
+      # 4) 產生圖表
       - name: Make charts
         env:
           REPORT_DATE: ${{ steps.meta.outputs.date }}
         run: python charts.py
 
-      # Step 5: 寄送 Email
+      # 5) 寄送 Email
       - name: Send email
         env:
           EMAIL_USERNAME: ${{ secrets.EMAIL_USERNAME }}
@@ -55,13 +73,22 @@ jobs:
           REPORT_DATE: ${{ steps.meta.outputs.date }}
         run: python send_email.py
 
-      # Step 6: 保存 artifacts (下載的檔案 + 報告)
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v3
+      # 6) 上傳成果（✅ 升級到 v4）
+      - name: Upload downloads (xlsx)
+        uses: actions/upload-artifact@v4
         with:
-          name: etf-tracker-${{ steps.meta.outputs.date }}
+          name: downloads-${{ steps.meta.outputs.date }}
+          path: downloads/*.xlsx
+          if-no-files-found: ignore
+          retention-days: 90
+
+      - name: Upload data/reports/charts
+        uses: actions/upload-artifact@v4
+        with:
+          name: outputs-${{ steps.meta.outputs.date }}
           path: |
-            downloads/*.xlsx
             data/*.csv
-            reports/*.json
-            reports/*.png
+            reports/*
+            charts/*
+          if-no-files-found: ignore
+          retention-days: 90
