@@ -1,93 +1,67 @@
-name: 00981A Daily Tracker
+name: Build and Mail
 
 on:
+  workflow_dispatch:
   schedule:
-    # 台北 18:00 (UTC+8) = 10:00 UTC；週一~週五
-    - cron: '0 10 * * 1-5'
-  workflow_dispatch: {}
-
-permissions:
-  contents: read
-
-concurrency:
-  group: daily-tracker
-  cancel-in-progress: false
+    - cron: "0 12 * * 1-5" # 平日台北時間晚上8點 (12:00 UTC)
 
 jobs:
-  run:
+  build:
     runs-on: ubuntu-latest
-    env:
-      TZ: Asia/Taipei
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v3
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v4
         with:
-          python-version: '3.10'
+          python-version: "3.10"
 
       - name: Install dependencies
         run: |
-          python -m pip install -U pip
-          pip install selenium pandas openpyxl matplotlib sendgrid
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-      # 1) 抓 EZMoney 的 XLSX 快照 -> downloads/YYYY-MM-DD.xlsx
+      # Step 1: 抓取當日 ETF 投資組合 XLSX
       - name: Fetch snapshot (XLSX)
-        run: |
-          python fetch_snapshot.py
+        run: python fetch_snapshot.py
 
-      # 2) 解析剛抓到的日期，傳給後續步驟
+      # Step 2: 解析 XLSX 檔名 → 抽出日期
       - name: Resolve snapshot date
         id: meta
         run: |
-          set -e
-          LATEST=$(ls -t downloads/*.xlsx | head -n1)
-          BASE=$(basename "$LATEST")
-          DATE="${BASE%.xlsx}"
-          echo "date=$DATE" >> "$GITHUB_OUTPUT"
-          echo "[main] snapshot date = $DATE"
+          latest_file=$(ls -t downloads/*.xlsx | head -n 1)
+          date_str=$(basename "$latest_file" .xlsx | sed 's/^ETF_Investment_Portfolio_//')
+          echo "[main] snapshot date = $date_str"
+          echo "date=$date_str" >> $GITHUB_OUTPUT
 
-      # 3) 轉 CSV（若你想簡化可移除此步；分析也可直接吃 XLSX）
-      - name: Convert XLSX -> CSV
-        run: |
-          python xlsx_to_csv.py --date "${{ steps.meta.outputs.date }}"
-
-      # 4) 產變化表（D1/D5/首次新增/賣出警示等）
+      # Step 3: 產生變動摘要 JSON
       - name: Build change table
-        run: |
-          python build_change_table.py
+        env:
+          REPORT_DATE: ${{ steps.meta.outputs.date }}
+        run: python build_change_table.py
 
-      # 5) 產圖（若缺圖 send_email 也會嘗試補產，但建議先畫好）
+      # Step 4: 產生圖表
       - name: Make charts
-        run: |
-          REPORT_DATE=${{ steps.meta.outputs.date }} python charts.py
+        env:
+          REPORT_DATE: ${{ steps.meta.outputs.date }}
+        run: python charts.py
 
-      # 6) 寄信（使用 SendGrid）
+      # Step 5: 寄送 Email
       - name: Send email
         env:
           EMAIL_USERNAME: ${{ secrets.EMAIL_USERNAME }}
-          EMAIL_TO:       ${{ secrets.EMAIL_TO }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
           SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
-          REPORT_DATE:    ${{ steps.meta.outputs.date }}
-        run: |
-          python send_email.py
+          REPORT_DATE: ${{ steps.meta.outputs.date }}
+        run: python send_email.py
 
-      # 7) 上傳 artifacts（downloads 與報表/圖表）
-      - name: Upload XLSX artifacts
-        uses: actions/upload-artifact@v4
+      # Step 6: 保存 artifacts (下載的檔案 + 報告)
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
         with:
-          name: downloads-${{ steps.meta.outputs.date }}
-          path: downloads/*.xlsx
-          if-no-files-found: ignore
-          retention-days: 90
-
-      - name: Upload reports & charts
-        uses: actions/upload-artifact@v4
-        with:
-          name: reports-charts-${{ steps.meta.outputs.date }}
+          name: etf-tracker-${{ steps.meta.outputs.date }}
           path: |
-            reports/*
-            charts/*
-          if-no-files-found: ignore
-          retention-days: 90
+            downloads/*.xlsx
+            data/*.csv
+            reports/*.json
+            reports/*.png
