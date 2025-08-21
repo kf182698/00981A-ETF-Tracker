@@ -7,7 +7,7 @@
 #   EMAIL_USERNAME, EMAIL_TO, SENDGRID_API_KEY
 #   NEW_HOLDING_MIN_WEIGHT（同步顯示於內文標題，預設 0.4）
 
-import os, re, json, glob, subprocess
+import os, re, json, glob, subprocess, base64
 from pathlib import Path
 import pandas as pd
 from sendgrid import SendGridAPIClient
@@ -18,17 +18,16 @@ CHART_DIR  = Path("charts")
 DATA_DIR   = Path("data")
 
 def _normalize_date(raw: str) -> str:
-    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw.strip()):
+    if raw and re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw.strip()):
         return raw.strip()
-    m = re.search(r"(\d{4})(\d{2})(\d{2})", raw)
-    if m:
-        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
-    raise ValueError(f"無法解析日期：{raw}")
-
-def _latest_date():
+    if raw:
+        m = re.search(r"(\d{4})(\d{2})(\d{2})", raw)
+        if m:
+            return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+    # fallback：取最新一份 summary
     js = sorted(glob.glob(str(REPORT_DIR / "summary_*.json")))
     if not js:
-        raise FileNotFoundError("沒有任何 summary_*.json")
+        raise FileNotFoundError("無法解析 REPORT_DATE，且找不到任何 summary_*.json")
     return Path(js[-1]).stem.split("_")[1]
 
 def _ensure_built(date_str: str):
@@ -53,58 +52,72 @@ def _read_table(date_str):
     return df, p
 
 def _fmt_pct(v):
-    if pd.isna(v): return "-"
-    return f"{float(v):.2f}%"
+    try:
+        return f"{float(v):.2f}%"
+    except Exception:
+        return "-"
 
 def _fmt_int(v):
-    if pd.isna(v): return "-"
-    return f"{int(v):,}"
+    try:
+        return f"{int(v):,}"
+    except Exception:
+        return "-"
 
 def _fmt_price(v):
-    if pd.isna(v): return "-"
-    return f"{float(v):.2f}"
+    try:
+        return f"{float(v):.2f}"
+    except Exception:
+        return "-"
 
-def _df_to_html(df: pd.DataFrame) -> str:
-    # 欄位名不改（已按規格命名），做簡單格式化
-    fmt = {}
-    # 自動偵測欄位
-    for c in df.columns:
-        if c.endswith("權重%") or c == "權重Δ%":
-            fmt[c] = lambda x: _fmt_pct(x)
-        elif c.startswith("股數_") or c == "買賣超股數":
-            fmt[c] = lambda x: _fmt_int(x)
-        elif c == "收盤價":
-            fmt[c] = lambda x: _fmt_price(x)
+def _cell(val, align="right", style=""):
+    return f'<td style="text-align:{align};padding:4px 6px;{style}">{val}</td>'
 
-    df_fmt = df.copy()
-    for c, fn in fmt.items():
-        if c in df_fmt.columns:
-            df_fmt[c] = df_fmt[c].apply(fn)
+def _th(val):
+    return f'<th style="text-align:right;padding:6px;border-bottom:1px solid #ddd;">{val}</th>'
 
-    # 簡易樣式：Δ% 正綠負紅
-    styles = [
-        dict(selector="th", props=[("text-align","right"),("padding","6px")]),
-        dict(selector="td", props=[("text-align","right"),("padding","4px 6px")]),
-        dict(selector="table", props=[("border-collapse","collapse"),("font-family","Arial"),("font-size","12px")]),
-    ]
-    def color_delta(val):
-        try:
-            v = float(str(val).replace("%",""))
-        except:
-            return ""
-        if v > 0:  return "color:#008800;"
-        if v < 0:  return "color:#cc0000;"
-        return ""
+def _df_to_html_manual(df: pd.DataFrame) -> str:
+    """不用 pandas Styler，手工渲染 HTML，Δ% 正綠負紅。"""
+    cols = list(df.columns)
+    # 表頭
+    html = ['<table style="border-collapse:collapse;font-family:Arial,Helvetica,sans-serif;font-size:12px;width:100%;">']
+    html.append("<thead><tr>")
+    for c in cols:
+        html.append(_th(c))
+    html.append("</tr></thead><tbody>")
+    # 資料列
+    for _, row in df.iterrows():
+        tds = []
+        for c in cols:
+            v = row[c]
+            if c.endswith("權重%") or c == "權重Δ%":
+                val = _fmt_pct(v)
+            elif c.startswith("股數_") or c == "買賣超股數":
+                val = _fmt_int(v)
+            elif c == "收盤價":
+                val = _fmt_price(v)
+            else:
+                val = str(v)
 
-    if "權重Δ%" in df_fmt.columns:
-        styler = df_fmt.style.applymap(color_delta, subset=["權重Δ%"]).set_table_styles(styles)
-    else:
-        styler = df_fmt.style.set_table_styles(styles)
-    return styler.hide(axis="index").to_html()
+            style = ""
+            if c == "權重Δ%":
+                try:
+                    f = float(v)
+                    if f > 0: style = "color:#008800;font-weight:600;"
+                    elif f < 0: style = "color:#cc0000;font-weight:600;"
+                except Exception:
+                    pass
+
+            align = "right"
+            if c in ("股票代號","股票名稱"):
+                align = "left"
+            tds.append(_cell(val, align=align, style=style))
+        html.append("<tr>" + "".join(tds) + "</tr>")
+    html.append("</tbody></table>")
+    return "".join(html)
 
 def main():
     raw = os.getenv("REPORT_DATE")
-    date_str = _normalize_date(raw) if raw else _latest_date()
+    date_str = _normalize_date(raw)
     _ensure_built(date_str)
 
     summary = _read_summary(date_str)
@@ -120,8 +133,12 @@ def main():
     # 首次新增持股（權重 > NEW_MIN）
     new_list = []
     for r in summary.get("new_holdings", []):
-        if float(r.get("今日權重%",0)) >= NEW_MIN:
-            new_list.append(f"{r['股票代號']} {r['股票名稱']}: {_fmt_pct(r['今日權重%'])}")
+        try:
+            wt = float(r.get("今日權重%",0))
+            if wt >= NEW_MIN:
+                new_list.append(f"{r['股票代號']} {r['股票名稱']}: {_fmt_pct(wt)}")
+        except Exception:
+            continue
 
     # 圖表（有就附上）
     imgs = []
@@ -129,26 +146,30 @@ def main():
         p = CHART_DIR / name
         if p.exists(): imgs.append(p)
 
-    # HTML
+    # HTML 內容
     html = []
     html.append(f"<p>您好，</p>")
     html.append(f"<p><b>00981A 今日追蹤摘要（{date_str}）</b></p>")
-    html.append(f"<p>▶ 今日總檔數：{total}　▶ 前十大權重合計：{top10:.2f}%　▶ 最大權重：{topw.get('code','')} {topw.get('name','')}（{topw.get('weight',0):.2f}%）<br>")
-    html.append(f"▶ 比較基期（昨）：{baseline}</p>")
+    html.append(
+        "<p>"
+        f"▶ 今日總檔數：{total}　"
+        f"▶ 前十大權重合計：{top10:.2f}%　"
+        f"▶ 最大權重：{topw.get('code','')} {topw.get('name','')}（{float(topw.get('weight',0)):.2f}%）<br>"
+        f"▶ 比較基期（昨）：{baseline}"
+        "</p>"
+    )
 
     if new_list:
         html.append(f"<p><b>🆕 首次新增持股（權重 &gt; {NEW_MIN:.2f}%）</b><br>")
         html.append(" &nbsp; - " + "<br> &nbsp; - ".join(new_list) + "</p>")
 
-    # 附圖
+    # 附圖（這版以附件方式附上；若改用內嵌 CID，需改成 SMTP/MIME 組件）
     for p in imgs:
-        html.append(f'<p><img src="cid:{p.name}" style="max-width:800px;width:100%;"></p>')
+        html.append(f'<p><i>附圖：</i> {p.name}</p>')
 
-    # 表格（依你指定欄位，已在 build 階段排序）
+    # 表格
     html.append("<p><b>📊 每日持股變化追蹤表</b></p>")
-    html.append(_df_to_html(df))
-
-    # 價格說明
+    html.append(_df_to_html_manual(df))
     html.append('<p style="color:#666;font-size:12px">* Price may be carried from the last available trading day.</p>')
 
     # 寄送
@@ -160,19 +181,27 @@ def main():
 
     mail = Mail(
         from_email=FR,
-        to_emails=TO.split(","),
+        to_emails=[t.strip() for t in TO.split(",") if t.strip()],
         subject=f"00981A Daily Tracker — {date_str}",
         html_content="".join(html),
     )
 
-    # 內嵌圖片
+    # 以附件方式附上圖檔與 CSV
     for p in imgs:
-        b64 = p.read_bytes().hex()  # SendGrid 需 base64；此處走 attachment cid 簡化可用 MIME，但 sendgrid helpers 不直接支援 related。
-        # 簡化：改為附件（非內嵌），避免 content-id 複雜處理。若你一定要內嵌，可改用 SMTP 或自行構建 MIME。
         mail.add_attachment(Attachment(
-            file_content=FileContent(p.read_bytes()),
+            file_content=FileContent(base64.b64encode(p.read_bytes()).decode()),
             file_type=FileType("image/png"),
             file_name=FileName(p.name),
+            disposition=Disposition("attachment"),
+        ))
+
+    # 附上當日 CSV 報表（方便點開檢視）
+    csv_path = REPORT_DIR / f"holdings_change_table_{date_str}.csv"
+    if csv_path.exists():
+        mail.add_attachment(Attachment(
+            file_content=FileContent(base64.b64encode(csv_path.read_bytes()).decode()),
+            file_type=FileType("text/csv"),
+            file_name=FileName(csv_path.name),
             disposition=Disposition("attachment"),
         ))
 
