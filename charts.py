@@ -1,100 +1,71 @@
-# charts.py (auto-convert CSV & auto-build summary if missing)
-# 1) D1 Weight Change (Top Movers) — barh
-# 2) Daily Weight Trend (Top Movers x5) — smoothed line
-# 3) Weekly Cumulative Weight Change (vs first week)
+# charts.py
+# 讀取 reports/summary_<DATE>.json，產生三張圖：
+# 1) D1 Weight Change (Top Movers)  2) Daily Weight Trend (Top Movers x5)
+# 3) Weekly Cumulative Weight Change (vs first)
 #
-# Env:
-#   REPORT_DATE=YYYY-MM-DD or string containing yyyymmdd
-#   e.g., "2025-08-11" or "ETF_Investment_Portfolio_20250811"
-#
-import os, glob, json, re, subprocess
+# 若缺 summary，會自動以 REPORT_DATE 呼叫 build_change_table.py 先建。
+# 若缺 data/<date>.csv，嘗試從 downloads/*.xlsx 轉檔（需有 xlsx_to_csv.py）。
+
+import os, re, glob, json, subprocess
 from pathlib import Path
 import pandas as pd
-import numpy as np
 import matplotlib.pyplot as plt
 
 REPORT_DIR = Path("reports")
-CHART_DIR = Path("charts")
-DATA_DIR = Path("data")
-DL_DIR = Path("downloads")
+DATA_DIR   = Path("data")
+DL_DIR     = Path("downloads")
+CHART_DIR  = Path("charts")
 CHART_DIR.mkdir(parents=True, exist_ok=True)
 
-def _latest_date():
-    js = sorted(glob.glob(str(REPORT_DIR / "summary_*.json")))
-    if not js:
-        raise FileNotFoundError("no summary_*.json, run build_change_table.py first")
-    return Path(js[-1]).stem.split("_")[1]
-
-def _normalize_report_date(s: str) -> str:
-    """Accepts 'YYYY-MM-DD' or any string containing yyyymmdd -> returns 'YYYY-MM-DD'."""
-    if not s:
-        return s
-    s = s.strip()
-    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
-        return s
-    m = re.search(r"(\d{4})(\d{2})(\d{2})", s)
+def _normalize_date(raw: str) -> str:
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw.strip()):
+        return raw.strip()
+    m = re.search(r"(\d{4})(\d{2})(\d{2})", raw)
     if m:
         return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
-    raise ValueError(f"Cannot parse REPORT_DATE: {s}")
+    raise ValueError(f"無法解析日期：{raw}")
 
-def _ensure_csv(date_str: str):
-    """If data/{date}.csv missing, try convert from downloads xlsx automatically."""
-    csv_path = DATA_DIR / f"{date_str}.csv"
-    if csv_path.exists():
-        return
-    # 找 downloads/{YYYY-MM-DD}.xlsx
-    xlsx_candidates = []
-    p1 = DL_DIR / f"{date_str}.xlsx"
-    if p1.exists():
-        xlsx_candidates.append(p1)
-    # 找 downloads/*{yyyymmdd}*.xlsx
-    yyyymmdd = date_str.replace("-", "")
-    xlsx_candidates += [Path(p) for p in glob.glob(str(DL_DIR / f"*{yyyymmdd}*.xlsx"))]
-    xlsx_candidates = [p for p in xlsx_candidates if p.exists()]
-
-    if not xlsx_candidates:
-        raise FileNotFoundError(
-            f"missing {csv_path} 且找不到對應 xlsx。\n"
-            f"請先轉檔：python xlsx_to_csv.py --date {date_str}"
-        )
-    # 有 xlsx → 自動轉
-    env = os.environ.copy()
-    print(f"[charts] CSV missing, auto convert from XLSX → data/{date_str}.csv")
-    subprocess.check_call(["python", "xlsx_to_csv.py", "--date", date_str], env=env)
-    if not csv_path.exists():
-        raise FileNotFoundError(f"轉檔後仍無 {csv_path}")
-
-def _load_summary(date_str):
-    with open(REPORT_DIR / f"summary_{date_str}.json", "r", encoding="utf-8") as f:
-        return json.load(f)
+def _latest_summary_date():
+    js = sorted(glob.glob(str(REPORT_DIR / "summary_*.json")))
+    if not js:
+        raise FileNotFoundError("找不到任何 summary_*.json")
+    return Path(js[-1]).stem.split("_")[1]
 
 def _ensure_summary(date_str: str):
-    """If summary missing, build it by calling build_change_table.py (will use data/{date}.csv)."""
-    sum_path = REPORT_DIR / f"summary_{date_str}.json"
-    if sum_path.exists():
-        return
-    _ensure_csv(date_str)
+    sp = REPORT_DIR / f"summary_{date_str}.json"
+    if sp.exists(): return
+    # 需要 data/<date>.csv，若沒有嘗試轉檔
+    dp = DATA_DIR / f"{date_str}.csv"
+    if not dp.exists():
+        # 嘗試將 downloads/ 的對應 xlsx 轉檔
+        ymd = date_str.replace("-","")
+        cand = list(DL_DIR.glob(f"*{ymd}*.xlsx"))
+        if (DL_DIR / f"{date_str}.xlsx").exists():
+            cand.append(DL_DIR / f"{date_str}.xlsx")
+        if cand:
+            print(f"[charts] convert XLSX -> CSV for {date_str}")
+            subprocess.check_call(["python","xlsx_to_csv.py","--date",date_str])
+    # 建 summary
     env = os.environ.copy()
-    env["REPORT_DATE"] = date_str  # 傳標準日期進去
-    print(f"[charts] summary missing, auto build via build_change_table.py for {date_str} …")
-    subprocess.check_call(["python", "build_change_table.py"], env=env)
-    if not sum_path.exists():
-        raise FileNotFoundError(f"build_change_table.py 執行後仍找不到 {sum_path}")
+    env["REPORT_DATE"] = date_str
+    print(f"[charts] build summary for {date_str}")
+    subprocess.check_call(["python","build_change_table.py"], env=env)
 
-def fig_d1_bars(date_str, summary, topn=10):
-    df_up = pd.DataFrame(summary.get("d1_up", []))
-    df_dn = pd.DataFrame(summary.get("d1_dn", []))
-    if not df_up.empty:
-        df_up["label"] = df_up["股票代號"].astype(str) + " " + df_up["股票名稱"].astype(str)
-    if not df_dn.empty:
-        df_dn["label"] = df_dn["股票代號"].astype(str) + " " + df_dn["股票名稱"].astype(str)
-    df_up = df_up.head(topn); df_dn = df_dn.head(topn)
+def _load_summary(date_str):
+    with open(REPORT_DIR / f"summary_{date_str}.json","r",encoding="utf-8") as f:
+        return json.load(f)
 
+def fig_d1(date_str, summary, topn=10):
+    df_up = pd.DataFrame(summary.get("d1_up",[]))
+    df_dn = pd.DataFrame(summary.get("d1_dn",[]))
+    for df in (df_up, df_dn):
+        if not df.empty:
+            df["label"] = df["股票代號"].astype(str) + " " + df["股票名稱"].astype(str)
     fig, ax = plt.subplots(figsize=(7,4.2), dpi=150)
     if not df_dn.empty:
-        ax.barh(df_dn["label"], df_dn["Δ%"], label="Down")
+        ax.barh(df_dn.head(topn)["label"], df_dn.head(topn)["權重Δ%"], label="Down")
     if not df_up.empty:
-        ax.barh(df_up["label"], df_up["Δ%"], label="Up")
+        ax.barh(df_up.head(topn)["label"], df_up.head(topn)["權重Δ%"], label="Up")
     ax.set_title("D1 Weight Change (Top Movers)")
     ax.set_xlabel("Δ% (percentage points)")
     ax.set_ylabel("Ticker Name")
@@ -105,24 +76,22 @@ def fig_d1_bars(date_str, summary, topn=10):
     return str(out)
 
 def fig_daily_trend(date_str, summary, k=5):
-    df_up = pd.DataFrame(summary.get("d1_up", []))
-    df_dn = pd.DataFrame(summary.get("d1_dn", []))
-    pool = pd.concat([df_up, df_dn], ignore_index=True) if (not df_up.empty or not df_dn.empty) else pd.DataFrame()
+    dates = summary.get("last5_dates",[])
+    if not dates: return None
+    # 取 D1 movers 前 k 名（正負皆可）
+    pool = pd.DataFrame(summary.get("d1_up",[]) + summary.get("d1_dn",[]))
     if pool.empty: return None
-
-    pool["abs"] = pool["Δ%"].abs()
+    pool["abs"] = pool["權重Δ%"].abs()
     pool = pool.sort_values("abs", ascending=False).head(k)
 
-    dates = summary.get("last5_dates", [])
-    if not dates: return None
-
+    # 構建每日權重序列
     series = {}
     for d in dates:
-        csv_path = DATA_DIR / f"{d}.csv"
-        if not csv_path.exists(): continue
-        csv = pd.read_csv(csv_path, encoding="utf-8-sig")
-        if "股票代號" not in csv.columns or "持股權重" not in csv.columns: continue
-        series[d] = csv.set_index("股票代號")["持股權重"]
+        fp = DATA_DIR / f"{d}.csv"
+        if not fp.exists(): continue
+        df = pd.read_csv(fp, encoding="utf-8-sig")
+        if "股票代號" not in df.columns or "持股權重" not in df.columns: continue
+        series[d] = df.set_index("股票代號")["持股權重"]
 
     if len(series) < 2: return None
 
@@ -130,9 +99,9 @@ def fig_daily_trend(date_str, summary, k=5):
     for _, row in pool.iterrows():
         code = str(row["股票代號"])
         y = [float(series.get(d, pd.Series()).get(code, 0.0)) for d in dates]
-        # simple smoothing
-        y_s = pd.Series(y).rolling(2, min_periods=1).mean().tolist() if len(y) >= 3 else y
-        ax.plot(dates, y_s, marker="o", label=code)
+        # 簡單平滑
+        y = pd.Series(y).rolling(2, min_periods=1).mean().tolist()
+        ax.plot(dates, y, marker="o", label=code)
     ax.set_title("Daily Weight Trend (Top Movers x5)")
     ax.set_xlabel("Date"); ax.set_ylabel("Weight %"); ax.legend()
     plt.tight_layout()
@@ -141,24 +110,21 @@ def fig_daily_trend(date_str, summary, k=5):
     return str(out)
 
 def fig_weekly_cum(date_str, summary):
-    dates = summary.get("last5_dates", [])
+    dates = summary.get("last5_dates",[])
     if not dates: return None
     first = dates[0]
+    # 取當日權重最高前 5 名畫累積變化
+    last_fp = DATA_DIR / f"{dates[-1]}.csv"
+    if not last_fp.exists(): return None
+    last_df = pd.read_csv(last_fp, encoding="utf-8-sig")
+    top_codes = last_df.sort_values("持股權重", ascending=False).head(5)["股票代號"].astype(str).tolist()
 
     series = {}
     for d in dates:
-        csv_path = DATA_DIR / f"{d}.csv"
-        if not csv_path.exists(): continue
-        csv = pd.read_csv(csv_path, encoding="utf-8-sig")
-        if "股票代號" not in csv.columns or "持股權重" not in csv.columns: continue
-        series[d] = csv.set_index("股票代號")["持股權重"]
-    if len(series) < 2: return None
-
-    last_csv = DATA_DIR / f"{dates[-1]}.csv"
-    if not last_csv.exists(): return None
-    last_df = pd.read_csv(last_csv, encoding="utf-8-sig")
-    if "股票代號" not in last_df.columns or "持股權重" not in last_df.columns: return None
-    top_codes = last_df.sort_values("持股權重", ascending=False).head(5)["股票代號"].astype(str).tolist()
+        fp = DATA_DIR / f"{d}.csv"
+        if not fp.exists(): continue
+        df = pd.read_csv(fp, encoding="utf-8-sig")
+        series[d] = df.set_index("股票代號")["持股權重"] if "股票代號" in df.columns else pd.Series(dtype=float)
 
     fig, ax = plt.subplots(figsize=(7,4.2), dpi=150)
     for code in top_codes:
@@ -173,10 +139,11 @@ def fig_weekly_cum(date_str, summary):
 
 def main():
     raw = os.getenv("REPORT_DATE")
-    date_str = _normalize_report_date(raw) if raw else _latest_date()
-    _ensure_summary(date_str)   # 自動補 CSV / 補 summary
+    date_str = _normalize_date(raw) if raw else _latest_summary_date()
+    _ensure_summary(date_str)
+
     summary = _load_summary(date_str)
-    p1 = fig_d1_bars(date_str, summary)
+    p1 = fig_d1(date_str, summary)
     p2 = fig_daily_trend(date_str, summary)
     p3 = fig_weekly_cum(date_str, summary)
     print("[charts] saved:", p1, p2, p3)
