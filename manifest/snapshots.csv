@@ -1,0 +1,2 @@
+fetch_date,snapshot_date,rows,weight_sum,hash,daily_path,snapshot_path,is_new_snapshot
+2025-08-29,2025-08-28,50,95.59,77df7258f1791dd3fbf65442e0a275ddf9b746d10e6288f7c2585a460988ea6e,archive/daily/2025-08-29.xlsx,archive/snapshots/ETF_Investment_Portfolio_20250828.xlsx,1
