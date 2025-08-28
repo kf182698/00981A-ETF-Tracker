@@ -1,0 +1,7 @@
+selenium
+pandas
+openpyxl
+chromedriver-autoinstaller
+matplotlib
+requests
+sendgrid==6.11.0
