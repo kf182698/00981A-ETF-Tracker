@@ -1,9 +1,10 @@
-# build_change_table.py — Clean fixed version (with baseline fallback, no triple quotes)
+# build_change_table.py — Clean fixed version (baseline fallback + price column fix)
 # 功能：
 # - 產出指定日期的「今 vs 昨」持股變化表與摘要 JSON
 # - 支援 REPORT_DATE：YYYY-MM-DD / YYYY-M-D / YYYYMMDD
 # - 預設：優先使用 data_snapshots/；若無回退 data/
-# - 基期挑選：先同層找 < 今日 最近一份 → 再回退 data/ → 若仍無，採「首日模式」（以今日為昨，Δ=0）
+# - 基期：先同層找 < 今日 最近一份 → 回退 data/ → 若仍無，首日模式（Δ=0）
+# - 價格欄位：只用「今日」的收盤價；合併後統一欄名為「收盤價」
 
 from __future__ import annotations
 import os
@@ -160,17 +161,39 @@ def main():
 
     print(f"[build] today={today_str}, prev={prev_str}, base_dir={base_dir}")
 
+    # 讀今、昨
     df_t = _read_csv(today_path)
-    df_t = _merge_price(df_t, today_str)
-
     if first_run:
         df_y = df_t.copy()
     else:
         df_y = _read_csv(prev_path)
 
+    # 昨日資料若含收盤價，先移除，避免合併產生收盤價_今/昨
+    if "收盤價" in df_y.columns:
+        df_y = df_y.drop(columns=["收盤價"])
+
+    # 合併今日價格（若無今日價，會自動回補最近一筆）
+    df_t = _merge_price(df_t, today_str)
+
     # 對齊今昨並計算
     key = ["股票代號", "股票名稱"]
     dfm = pd.merge(df_t, df_y, on=key, how="outer", suffixes=("_今", "_昨"))
+
+    # 合併後保險：統一「收盤價」欄名
+    preferred_order = ["收盤價_今", "收盤價", "收盤價_x", "收盤價_y", "收盤價_昨"]
+    chosen = None
+    for c in preferred_order:
+        if c in dfm.columns:
+            chosen = c
+            break
+    if chosen:
+        if chosen != "收盤價":
+            dfm.rename(columns={chosen: "收盤價"}, inplace=True)
+        for c in ["收盤價_今", "收盤價_x", "收盤價_y", "收盤價_昨"]:
+            if c != chosen and c in dfm.columns:
+                dfm.drop(columns=[c], inplace=True)
+    else:
+        dfm["收盤價"] = pd.NA
 
     for c in ["股數_今", "股數_昨"]:
         dfm[c] = pd.to_numeric(dfm.get(c), errors="coerce").fillna(0).astype(int)
@@ -223,7 +246,7 @@ def main():
     summary = {
         "date": today_str,
         "baseline_date": prev_str,
-        "first_run_mode": bool(first_run),  # 首日模式標記
+        "first_run_mode": bool(first_run),
         "total_count": int(df_t["股票代號"].nunique()),
         "top10_sum": round(float(top10_sum), 4),
         "top_weight": {
