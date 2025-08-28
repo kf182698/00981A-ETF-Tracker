@@ -1,10 +1,9 @@
-# build_change_table.py — Clean fixed version (no triple-quoted strings)
+# build_change_table.py — Clean fixed version (with baseline fallback, no triple quotes)
 # 功能：
 # - 產出指定日期的「今 vs 昨」持股變化表與摘要 JSON
-# - 支援 REPORT_DATE 格式：YYYY-MM-DD / YYYY-M-D / YYYYMMDD
-# - 預設優先使用 data_snapshots/（去重後的“真快照序列”），否則回退 data/
-# - 基期挑選：在相同資料夾中挑選 < 今日 的最近一份（對跨假日友善）
-# - 價格：只讀取已保存的 prices/<date>.csv，若當天沒有則向前回補最近一筆
+# - 支援 REPORT_DATE：YYYY-MM-DD / YYYY-M-D / YYYYMMDD
+# - 預設：優先使用 data_snapshots/；若無回退 data/
+# - 基期挑選：先同層找 < 今日 最近一份 → 再回退 data/ → 若仍無，採「首日模式」（以今日為昨，Δ=0）
 
 from __future__ import annotations
 import os
@@ -28,13 +27,11 @@ def _normalize_report_date(raw: str) -> str:
         raise ValueError("REPORT_DATE is None")
     s = str(raw).strip()
 
-    # yyyy-m-d / yyyy-mm-dd
     m = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", s)
     if m:
         y, mo, d = m.groups()
         return f"{y}-{int(mo):02d}-{int(d):02d}"
 
-    # yyyymmdd
     m = re.fullmatch(r"(\d{4})(\d{2})(\d{2})", s)
     if m:
         return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
@@ -42,9 +39,7 @@ def _normalize_report_date(raw: str) -> str:
     raise ValueError(f"無法解析 REPORT_DATE：{raw}")
 
 def _pick_default_date_and_base():
-    # 未提供 REPORT_DATE 時：
-    #   1) 優先使用 data_snapshots/ 最新一份
-    #   2) 否則使用 data/ 最新一份
+    # 未提供 REPORT_DATE 時：1) 取 data_snapshots 最新一份；2) 否則取 data 最新一份
     snaps = sorted(glob.glob(str(SNAP_DATA_DIR / "*.csv")))
     if snaps:
         date_str = Path(snaps[-1]).stem
@@ -58,14 +53,12 @@ def _pick_default_date_and_base():
     raise FileNotFoundError("找不到任何 CSV（data_snapshots/ 或 data/）")
 
 def _choose_base_dir(date_str: str) -> Path:
-    # 對於顯式指定的 REPORT_DATE：
-    #   - 若 data_snapshots/<date>.csv 存在 → 使用 data_snapshots/
-    #   - 否則檢查 data/<date>.csv → 使用 data/
+    # 指定 REPORT_DATE 時的資料夾選擇
     if (SNAP_DATA_DIR / f"{date_str}.csv").exists():
         return SNAP_DATA_DIR
     if (DATA_DIR / f"{date_str}.csv").exists():
         return DATA_DIR
-    # 兩邊都沒有，仍偏好 snapshots 作搜尋/提示
+    # 兩邊都沒有，仍偏向 snapshots
     if SNAP_DATA_DIR.exists():
         return SNAP_DATA_DIR
     return DATA_DIR
@@ -83,7 +76,7 @@ def _read_csv(path: Path) -> pd.DataFrame:
     df["持股權重"] = pd.to_numeric(df["持股權重"], errors="coerce").fillna(0.0)
     return df
 
-# ------------------------- 價格處理（只讀已保存快取） ------------------------- #
+# ------------------------- 價格處理（讀 prices/*；若無則往前補） ------------------------- #
 def _normalize_price_df(df: pd.DataFrame) -> None:
     if "股票代號" not in df.columns:
         rename_map = {}
@@ -100,7 +93,6 @@ def _normalize_price_df(df: pd.DataFrame) -> None:
         df["收盤價"] = pd.to_numeric(df["收盤價"], errors="coerce")
 
 def _load_prices_for(date_str: str) -> pd.DataFrame:
-    # 優先讀 prices/<date>.csv；若不存在，往前尋找最近的一天（最多回溯 90 天）
     p = PRICE_DIR / f"{date_str}.csv"
     if p.exists():
         df = pd.read_csv(p, encoding="utf-8-sig")
@@ -127,7 +119,7 @@ def _merge_price(df_today: pd.DataFrame, date_str: str) -> pd.DataFrame:
 
 # ------------------------- 基期挑選 ------------------------- #
 def _find_prev_by_listing(today_str: str, base_dir: Path):
-    # 在 base_dir/*.csv 內，挑選「日期 < today_str」的最近一份。
+    # 在 base_dir/*.csv 內挑選「日期 < today_str」最近一份
     files = sorted(Path(base_dir).glob("*.csv"), key=lambda p: p.name)
     cands = [p for p in files if p.stem < today_str]
     if not cands:
@@ -139,30 +131,44 @@ def _find_prev_by_listing(today_str: str, base_dir: Path):
 def main():
     raw = os.getenv("REPORT_DATE")
     if raw:
-        # 顯式指定日期 → 正規化 → 選 base_dir
         today_str = _normalize_report_date(raw)
         base_dir = _choose_base_dir(today_str)
     else:
-        # 預設使用最新快照（無則回退 data/）
         today_str, base_dir = _pick_default_date_and_base()
 
+    # 今日檔
     today_path = base_dir / f"{today_str}.csv"
     if not today_path.exists():
-        raise FileNotFoundError(f"找不到今日 CSV：{today_path}")
+        # 若 snapshots 當天沒有，但 data 有，回退
+        alt = DATA_DIR / f"{today_str}.csv"
+        if alt.exists():
+            base_dir = DATA_DIR
+            today_path = alt
+        else:
+            raise FileNotFoundError(f"找不到今日 CSV：{today_path}")
 
+    # 找基期（先同層 → 回退 data/ → 若仍無則首日模式）
     prev_str, prev_path = _find_prev_by_listing(today_str, base_dir)
+    if not prev_path and base_dir == SNAP_DATA_DIR:
+        prev_str, prev_path = _find_prev_by_listing(today_str, DATA_DIR)
+
+    first_run = False
     if not prev_path:
-        raise RuntimeError(f"找不到 {today_str} 之前的可用 CSV 作為比較基期（於 {base_dir}）")
+        # 首日模式：以今日自身作為基期，確保不中斷（變動全為0）
+        first_run = True
+        prev_str = today_str
 
     print(f"[build] today={today_str}, prev={prev_str}, base_dir={base_dir}")
 
     df_t = _read_csv(today_path)
-    df_y = _read_csv(prev_path)
-
-    # 合併價格（若無今日價，會自動回補最近一筆）
     df_t = _merge_price(df_t, today_str)
 
-    # 對齊今昨並計算變動
+    if first_run:
+        df_y = df_t.copy()
+    else:
+        df_y = _read_csv(prev_path)
+
+    # 對齊今昨並計算
     key = ["股票代號", "股票名稱"]
     dfm = pd.merge(df_t, df_y, on=key, how="outer", suffixes=("_今", "_昨"))
 
@@ -175,16 +181,15 @@ def main():
     dfm["權重Δ%"]   = (dfm["持股權重_今"] - dfm["持股權重_昨"]).round(4)
 
     # 門檻（可由環境覆寫）
-    NEW_MIN = float(os.getenv("NEW_HOLDING_MIN_WEIGHT", "0.4"))  # 首次新增持股最小權重
-    SELL_MAX = float(os.getenv("SELL_ALERT_MAX_WEIGHT", "0.1"))  # 賣出警示門檻
-    NOISE    = float(os.getenv("NOISE_THRESHOLD", "0.01"))       # 噪音門檻（百分點）
+    NEW_MIN = float(os.getenv("NEW_HOLDING_MIN_WEIGHT", "0.4"))
+    SELL_MAX = float(os.getenv("SELL_ALERT_MAX_WEIGHT", "0.1"))
+    NOISE    = float(os.getenv("NOISE_THRESHOLD", "0.01"))
     TOPN     = int(os.getenv("TOP_N", "10"))
 
-    # 新增/賣出標記
     new_mask  = (dfm["持股權重_昨"] <= 0.0 + 1e-12) & (dfm["持股權重_今"] >= NEW_MIN)
     sell_mask = (dfm["持股權重_今"] <= SELL_MAX) & (dfm["持股權重_昨"] > NOISE)
 
-    # 輸出表格（依規格命名與欄位）
+    # 輸出表格
     today_col = f"股數_{today_str}"
     prev_col  = f"股數_{prev_str}"
     out = dfm[[
@@ -200,14 +205,13 @@ def main():
     out_path = REPORT_DIR / f"holdings_change_table_{today_str}.csv"
     out.to_csv(out_path, index=False, encoding="utf-8-sig")
 
-    # 摘要資料
+    # 摘要
     movers = dfm.copy()
     movers["abs"] = movers["權重Δ%"].abs()
     movers = movers[movers["abs"] >= NOISE]
     d1_up = movers.sort_values("權重Δ%", ascending=False).head(TOPN)
     d1_dn = movers.sort_values("權重Δ%", ascending=True).head(TOPN)
 
-    # 近 5 個可用日期（含今日）
     files = sorted(Path(base_dir).glob("*.csv"), key=lambda p: p.name)
     upto_today = [p for p in files if p.stem <= today_str]
     last5 = upto_today[-5:] if upto_today else [today_path]
@@ -219,6 +223,7 @@ def main():
     summary = {
         "date": today_str,
         "baseline_date": prev_str,
+        "first_run_mode": bool(first_run),  # 首日模式標記
         "total_count": int(df_t["股票代號"].nunique()),
         "top10_sum": round(float(top10_sum), 4),
         "top_weight": {
