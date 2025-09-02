@@ -4,3 +4,4 @@ fetch_date,snapshot_date,rows,weight_sum,hash,daily_path,snapshot_path,is_new_sn
 2025-08-30,2025-08-29,50,95.8,8c8ed197e90c26ce886e9b87e2d1b7c58089974b8e29e460ca65da34cf74ba3b,archive/daily/2025-08-30.xlsx,,0
 2025-08-31,2025-08-29,50,95.8,8c8ed197e90c26ce886e9b87e2d1b7c58089974b8e29e460ca65da34cf74ba3b,archive/daily/2025-08-31.xlsx,,0
 2025-09-01,2025-09-01,50,92.45,183f63d5b7739b856f4b449affcf25bce2633eb3a47429b471e7c78957988597,archive/daily/2025-09-01.xlsx,archive/snapshots/ETF_Investment_Portfolio_20250901.xlsx,1
+2025-09-02,2025-09-02,50,92.74,d00dd8bf69df93a9f7c966feaf92b923860d3d87560d38cf3589fe1e4ca226d1,archive/daily/2025-09-02.xlsx,archive/snapshots/ETF_Investment_Portfolio_20250902.xlsx,1
