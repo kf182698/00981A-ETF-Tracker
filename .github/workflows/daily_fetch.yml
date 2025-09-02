@@ -26,10 +26,15 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Install dependencies
+      - name: Install base dependencies
         run: |
           python -m pip install -U pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      # 保障：就算 requirements.txt 還沒補齊，也確保爬蟲會動
+      - name: Install scraping deps (bs4 + lxml) & yfinance (fallback)
+        run: |
+          pip install -q --upgrade beautifulsoup4 lxml yfinance || true
 
       - name: Determine REPORT_DATE
         id: determine_date
@@ -59,8 +64,6 @@ jobs:
 
       - name: Build prices CSV (TWSE/TPEx; Yahoo fallback)
         run: |
-          # 若 requirements.txt 未含 yfinance，臨時裝一下（已裝會快取命中）
-          pip install -q yfinance || true
           python build_prices.py
 
       # 只在內容有變化時才產生 snapshot，避免非交易日新增重覆檔
