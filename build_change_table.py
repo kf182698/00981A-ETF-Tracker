@@ -1,4 +1,4 @@
-# build_change_table.py — Clean fixed (baseline fallback + price backfill + new/sell direct)
+# build_change_table.py — baseline fallback + price from prices/ or XLSX + robust new/sell
 from __future__ import annotations
 import os, re, glob, json
 from pathlib import Path
@@ -9,9 +9,10 @@ DATA_DIR        = Path("data")
 SNAP_DATA_DIR   = Path("data_snapshots")
 REPORT_DIR      = Path("reports")
 PRICE_DIR       = Path("prices")
+ARCHIVE_DIR     = Path("archive")
 REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
-# ---------- 日期處理 ----------
+# -------- 日期處理 --------
 def _normalize_report_date(raw: str) -> str:
     if raw is None:
         raise ValueError("REPORT_DATE is None")
@@ -37,11 +38,13 @@ def _pick_default_date_and_base():
     raise FileNotFoundError("找不到任何 CSV（data_snapshots/ 或 data/）")
 
 def _choose_base_dir(date_str: str) -> Path:
-    if (SNAP_DATA_DIR / f"{date_str}.csv").exists(): return SNAP_DATA_DIR
-    if (DATA_DIR / f"{date_str}.csv").exists():       return DATA_DIR
+    if (SNAP_DATA_DIR / f"{date_str}.csv").exists():
+        return SNAP_DATA_DIR
+    if (DATA_DIR / f"{date_str}.csv").exists():
+        return DATA_DIR
     return SNAP_DATA_DIR if SNAP_DATA_DIR.exists() else DATA_DIR
 
-# ---------- 讀檔 ----------
+# -------- 讀檔 --------
 def _read_csv(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path, encoding="utf-8-sig")
     required = ["股票代號","股票名稱","股數","持股權重"]
@@ -54,68 +57,92 @@ def _read_csv(path: Path) -> pd.DataFrame:
     df["持股權重"] = pd.to_numeric(df["持股權重"], errors="coerce").fillna(0.0)
     return df
 
-# ---------- 價格處理 ----------
+# -------- 價格處理 --------
 def _normalize_price_df(df: pd.DataFrame) -> None:
     if "股票代號" not in df.columns:
         rename_map = {}
         for c in df.columns:
             sc = str(c).strip()
             if sc in ("代號","證券代號","StockCode"): rename_map[c] = "股票代號"
-            if sc in ("收盤","收盤價","Close","close"): rename_map[c] = "收盤價"
-        if rename_map: df.rename(columns=rename_map, inplace=True)
+            if sc in ("收盤","收盤價","Close","close","收盤價(元)"): rename_map[c] = "收盤價"
+        if rename_map:
+            df.rename(columns=rename_map, inplace=True)
     df["股票代號"] = df["股票代號"].astype(str).str.strip()
     if "收盤價" in df.columns:
         df["收盤價"] = pd.to_numeric(df["收盤價"], errors="coerce")
 
 def _load_prices_for(date_str: str) -> pd.DataFrame:
+    """優先讀 prices/<date>.csv；若無 → 讀 archive/<YYYY-MM>/*YYYYMMDD*.xlsx 的 with_prices；
+       再無 → 向前回補最近 90 天（兩來源都試）。"""
+    # 1) prices/YYYY-MM-DD.csv
     p = PRICE_DIR / f"{date_str}.csv"
     if p.exists():
         df = pd.read_csv(p, encoding="utf-8-sig")
         _normalize_price_df(df)
+        print(f"[price] use prices CSV: {p}")
         return df[["股票代號","收盤價"]].copy()
-    # 回溯最近一日價格
-    d = datetime.strptime(date_str,"%Y-%m-%d").date()
+
+    # 2) archive 的 with_prices
+    yyyymm   = date_str[:7]
+    yyyymmdd = date_str.replace("-", "")
+    month_dir = ARCHIVE_DIR / yyyymm
+    cands = sorted(glob.glob(str(month_dir / f"*{yyyymmdd}*.xlsx")))
+    if cands:
+        try:
+            df = pd.read_excel(cands[-1], sheet_name="with_prices", dtype={"股票代號": str})
+            _normalize_price_df(df)
+            out = df[["股票代號","收盤價"]].copy()
+            print(f"[price] use archive xlsx: {Path(cands[-1]).name}")
+            return out
+        except Exception as e:
+            print(f"[price] read xlsx with_prices failed: {e}")
+
+    # 3) 往前回補最多 90 天
+    d = datetime.strptime(date_str, "%Y-%m-%d").date()
     for _ in range(90):
         d = d - timedelta(days=1)
-        q = PRICE_DIR / f"{d}.csv"
-        if q.exists():
-            df = pd.read_csv(q, encoding="utf-8-sig")
+        # prices/
+        p = PRICE_DIR / f"{d}.csv"
+        if p.exists():
+            df = pd.read_csv(p, encoding="utf-8-sig")
             _normalize_price_df(df)
+            print(f"[price] fallback prices CSV: {p}")
             return df[["股票代號","收盤價"]].copy()
+        # archive/with_prices
+        yyyymm = str(d)[:7]; yyyymmdd = str(d).replace("-", "")
+        cands = sorted(glob.glob(str(ARCHIVE_DIR / yyyymm / f"*{yyyymmdd}*.xlsx")))
+        if cands:
+            try:
+                df = pd.read_excel(cands[-1], sheet_name="with_prices", dtype={"股票代號": str})
+                _normalize_price_df(df)
+                out = df[["股票代號","收盤價"]].copy()
+                print(f"[price] fallback archive xlsx: {Path(cands[-1]).name}")
+                return out
+            except Exception as e:
+                print(f"[price] fallback xlsx failed: {e}")
+
+    print("[price] no price found")
     return pd.DataFrame(columns=["股票代號","收盤價"])
 
 def _merge_price(df_today: pd.DataFrame, date_str: str) -> pd.DataFrame:
-    # 1) 先移除既有收盤價欄，避免 _x/_y
     if "收盤價" in df_today.columns:
         df_today = df_today.drop(columns=["收盤價"])
-    # 2) 以今日（或最近一日）prices 合併
     px = _load_prices_for(date_str)
-    out = df_today.merge(px, on="股票代號", how="left")
-    # 3) 逐日回補最多 7 天
-    if out["收盤價"].isna().any():
-        d = datetime.strptime(date_str,"%Y-%m-%d").date()
-        for _ in range(7):
-            d = d - timedelta(days=1)
-            alt = PRICE_DIR / f"{d}.csv"
-            if not alt.exists(): continue
-            prev = pd.read_csv(alt, encoding="utf-8-sig")
-            _normalize_price_df(prev)
-            out = out.merge(prev[["股票代號","收盤價"]].rename(columns={"收盤價":"收盤價_prev"}),
-                            on="股票代號", how="left")
-            out["收盤價"] = out["收盤價"].fillna(out["收盤價_prev"])
-            out.drop(columns=["收盤價_prev"], inplace=True)
-            if not out["收盤價"].isna().any(): break
-    return out
+    if px.empty:
+        df_today["收盤價"] = pd.NA
+        return df_today
+    return df_today.merge(px, on="股票代號", how="left")
 
-# ---------- 基期 ----------
+# -------- 基期 --------
 def _find_prev_by_listing(today_str: str, base_dir: Path):
     files = sorted(Path(base_dir).glob("*.csv"), key=lambda p: p.name)
     cands = [p for p in files if p.stem < today_str]
-    if not cands: return None, None
+    if not cands:
+        return None, None
     prev = cands[-1]
     return prev.stem, prev
 
-# ---------- 主流程 ----------
+# -------- 主流程 --------
 def main():
     raw = os.getenv("REPORT_DATE")
     if raw:
@@ -127,8 +154,10 @@ def main():
     today_path = base_dir / f"{today_str}.csv"
     if not today_path.exists():
         alt = DATA_DIR / f"{today_str}.csv"
-        if alt.exists(): base_dir, today_path = DATA_DIR, alt
-        else: raise FileNotFoundError(f"找不到今日 CSV：{today_path}")
+        if alt.exists():
+            base_dir, today_path = DATA_DIR, alt
+        else:
+            raise FileNotFoundError(f"找不到今日 CSV：{today_path}")
 
     prev_str, prev_path = _find_prev_by_listing(today_str, base_dir)
     if not prev_path and base_dir == SNAP_DATA_DIR:
@@ -141,18 +170,18 @@ def main():
 
     print(f"[build] today={today_str}, prev={prev_str}, base_dir={base_dir}")
 
-    # 今、昨
+    # 讀今、昨
     df_t = _read_csv(today_path)
     df_t = _merge_price(df_t, today_str)
+    if first_run:
+        df_y = df_t.copy()
+    else:
+        df_y = _read_csv(prev_path)
 
-    if first_run: df_y = df_t.copy()
-    else:         df_y = _read_csv(prev_path)
-
-    # 若昨檔含收盤價，先移除
     if "收盤價" in df_y.columns:
         df_y = df_y.drop(columns=["收盤價"])
 
-    # 以「股票代號」合併，名稱以今日優先
+    # 以股票代號合併，名稱以今日優先
     key = ["股票代號"]
     dfm = pd.merge(df_t, df_y, on=key, how="outer", suffixes=("_今","_昨"))
     if "股票名稱_今" in dfm.columns or "股票名稱_昨" in dfm.columns:
@@ -201,12 +230,13 @@ def main():
         "股數_今","持股權重_今","股數_昨","持股權重_昨","買賣超股數","權重Δ%"
     ]].rename(columns={
         "股數_今": today_col, "股數_昨": prev_col,
-        "持股權重_今":"今日權重%", "持股權重_昨":"昨日權重%"
+        "持股權重_今": "今日權重%", "持股權重_昨": "昨日權重%"
     }).sort_values("權重Δ%", ascending=False)
+
     out_path = REPORT_DIR / f"holdings_change_table_{today_str}.csv"
     out.to_csv(out_path, index=False, encoding="utf-8-sig")
 
-    # 近 5 個可用日期（含今日）
+    # 近 5 個日期
     files = sorted(Path(base_dir).glob("*.csv"), key=lambda p: p.name)
     upto_today = [p for p in files if p.stem <= today_str]
     last5 = upto_today[-5:] if upto_today else [today_path]
@@ -226,7 +256,6 @@ def main():
             "name": str(top1["股票名稱"]),
             "weight": round(float(top1["持股權重"]), 4),
         },
-        # ✅ 不受 TopN/NOISE 影響
         "new_holdings": (
             dfm[new_mask]
             .sort_values("持股權重_今", ascending=False)
@@ -239,7 +268,6 @@ def main():
             [["股票代號","股票名稱","持股權重_昨","持股權重_今","權重Δ%"]]
             .to_dict(orient="records")
         ),
-        # 圖用 movers（仍保留 TopN/NOISE）
         "d1_up": d1_up[["股票代號","股票名稱","持股權重_昨","持股權重_今","權重Δ%"]].to_dict(orient="records"),
         "d1_dn": d1_dn[["股票代號","股票名稱","持股權重_昨","持股權重_今","權重Δ%"]].to_dict(orient="records"),
         "last5_dates": last5_dates,
