@@ -1,46 +1,112 @@
-name: Daily Fetch (00981A raw snapshot)
+name: Daily Fetch
+
 on:
-  schedule:
-    - cron: "0 12 * * *"
   workflow_dispatch:
-permissions:
-  contents: write
+    inputs:
+      report_date:
+        description: "指定日期 (YYYY-MM-DD 或 YYYYMMDD)，留空則用台北今天"
+        required: false
+        default: ""
+  schedule:
+    # UTC 09:10 = 台北 17:10（可依需求調整）
+    - cron: "10 9 * * 1-5"
+
 jobs:
   fetch:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
     env:
       TZ: Asia/Taipei
+
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.10"
-      - name: Install minimal deps
+
+      - name: Install deps
         run: |
           python -m pip install -U pip
-          pip install selenium pandas openpyxl chromedriver-autoinstaller matplotlib requests
-      - name: Run fetcher (download -> with_prices -> csv)
-        run: python etf_tracker.py
-      - name: Commit & push (raw + dedup snapshot)
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/ archive/ manifest/ data_snapshots/ prices/ || true
-          git diff --cached --quiet || git commit -m "Daily raw snapshot: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          git push
-      - name: Upload screenshots (if any)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: screenshots
-          path: screenshots/
-          if-no-files-found: ignore
-          - name: Export prices CSV from Xlsx
-  env:
-    REPORT_DATE: ${{ steps.determine_date.outputs.REPORT_DATE }}
-  run: |
-    python export_prices_from_xlsx.py
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
+      - name: Determine REPORT_DATE
+        id: determine_date
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.report_date }}" ]; then
+            RAW="${{ github.event.inputs.report_date }}"
+          else
+            RAW="$(date +'%Y-%m-%d')"
+          fi
+          # 轉為 YYYY-MM-DD
+          if [[ "$RAW" =~ ^[0-9]{8}$ ]]; then
+            REPORT_DATE="${RAW:0:4}-${RAW:4:2}-${RAW:6:2}"
+          else
+            REPORT_DATE="$(date -d "$RAW" +'%Y-%m-%d')"
+          fi
+          echo "REPORT_DATE=$REPORT_DATE" | tee -a $GITHUB_OUTPUT
+          echo "REPORT_DATE=$REPORT_DATE" >> $GITHUB_ENV
+
+      - name: Fetch latest XLSX
+        run: |
+          python fetch_snapshot.py
+
+      - name: Convert XLSX -> daily CSV (data/YYYY-MM-DD.csv)
+        run: |
+          python xlsx_to_csv.py
+
+      # 只在內容有變化時，才新增一份 snapshot（避免非交易日重算）
+      - name: Update snapshots if changed
+        run: |
+          python - <<'PY'
+          import glob, os
+          from pathlib import Path
+          import pandas as pd
+          date = os.environ["REPORT_DATE"]
+          today = Path("data")/f"{date}.csv"
+          Path("data_snapshots").mkdir(exist_ok=True)
+          if not today.exists():
+              raise SystemExit(f"missing {today}")
+          def load(p):
+              df = pd.read_csv(p, encoding="utf-8-sig")
+              cols = [c for c in ["股票代號","股票名稱","股數","持股權重"] if c in df.columns]
+              df = df[cols].copy()
+              df["股票代號"] = df["股票代號"].astype(str).str.strip()
+              df["股票名稱"] = df["股票名稱"].astype(str).str.strip()
+              df["股數"] = pd.to_numeric(df["股數"], errors="coerce").fillna(0).astype(int)
+              df["持股權重"] = pd.to_numeric(df["持股權重"], errors="coerce").fillna(0.0).round(6)
+              return df.sort_values(["股票代號"]).reset_index(drop=True)
+          df_today = load(today)
+          snaps = sorted(glob.glob("data_snapshots/*.csv"))
+          same = False
+          if snaps:
+              df_prev = load(snaps[-1])
+              same = df_today.equals(df_prev)
+          if not same:
+              df_today.to_csv(f"data_snapshots/{date}.csv", index=False, encoding="utf-8-sig")
+              print("[snapshot] saved data_snapshots/", date)
+          else:
+              print("[snapshot] no change; skip")
+          PY
+
+      - name: Build change table + summary
+        run: |
+          python build_change_table.py
+
+      - name: Generate charts
+        run: |
+          python charts.py
+
+      - name: Commit & push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "nothing to commit"
+          else
+            git commit -m "Daily update: ${REPORT_DATE}"
+            git push
+          fi
