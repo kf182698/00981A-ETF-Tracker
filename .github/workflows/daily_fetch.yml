@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       report_date:
-        description: "指定日期 (YYYY-MM-DD 或 YYYYMMDD)，留空用台北今天"
+        description: "指定日期 (YYYY-MM-DD 或 YYYYMMDD)，留空則用台北今天"
         required: false
         default: ""
-  # 平日 17:10 台北時間（UTC 09:10）
   schedule:
+    # UTC 09:10 ≈ 台北 17:10（工作日）
     - cron: "10 9 * * 1-5"
 
 jobs:
@@ -26,7 +26,7 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install -U pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
@@ -40,6 +40,7 @@ jobs:
           else
             RAW="$(date +'%Y-%m-%d')"
           fi
+          # 規範成 YYYY-MM-DD
           if [[ "$RAW" =~ ^[0-9]{8}$ ]]; then
             REPORT_DATE="${RAW:0:4}-${RAW:4:2}-${RAW:6:2}"
           else
@@ -48,86 +49,21 @@ jobs:
           echo "REPORT_DATE=$REPORT_DATE" | tee -a $GITHUB_OUTPUT
           echo "REPORT_DATE=$REPORT_DATE" >> $GITHUB_ENV
 
-      # ------------------ 抓檔（若沒有腳本會自動略過） ------------------
-      - name: Fetch latest XLSX (skip if script missing)
-        shell: bash
+      - name: Fetch latest XLSX
         run: |
-          set -euo pipefail
-          TARGET="$(git ls-files | grep -E '(^|/)?fetch_snapshot\.py$' | head -n1 || true)"
-          if [ -n "$TARGET" ]; then
-            echo "[run] python $TARGET"
-            python "$TARGET" || echo "[warn] fetch script returned non-zero, continue…"
-          else
-            echo "[skip] fetch_snapshot.py 不存在，略過抓檔。"
-          fi
+          python fetch_snapshot.py
 
-      - name: Convert XLSX -> daily CSV (skip if script missing)
-        shell: bash
+      - name: Convert XLSX -> daily CSV (data/YYYY-MM-DD.csv)
         run: |
-          set -euo pipefail
-          TARGET="$(git ls-files | grep -E '(^|/)?xlsx_to_csv\.py$' | head -n1 || true)"
-          if [ -n "$TARGET" ]; then
-            echo "[run] python $TARGET"
-            python "$TARGET" || echo "[warn] xlsx_to_csv 失敗，後續會以前日覆寫補上。"
-          else
-            echo "[skip] xlsx_to_csv.py 不存在，後續會以前日覆寫補上。"
-          fi
+          python xlsx_to_csv.py
 
-      # 可選：若你有 export_prices_from_xlsx.py，會嘗試從 with_prices 匯出 prices/CSV
-      - name: Export prices CSV from Xlsx (if available)
-        shell: bash
+      - name: Build prices CSV (TWSE/TPEx; Yahoo fallback)
         run: |
-          set -euo pipefail
-          if [ -f export_prices_from_xlsx.py ]; then
-            echo "[run] python export_prices_from_xlsx.py"
-            python export_prices_from_xlsx.py || echo "[warn] export prices 失敗，待會用前日覆寫。"
-          else
-            echo "[skip] export_prices_from_xlsx.py 不存在。"
-          fi
+          # 若 requirements.txt 未含 yfinance，臨時裝一下（已裝會快取命中）
+          pip install -q yfinance || true
+          python build_prices.py
 
-      # ------------------ 前日覆寫保底（確保今天一定有檔） ------------------
-      - name: Ensure today's data CSV exists (copy-forward if missing)
-        run: |
-          python - <<'PY'
-          import os, glob, shutil
-          from pathlib import Path
-          d = os.environ["REPORT_DATE"]
-          dst = Path("data")/f"{d}.csv"
-          dst.parent.mkdir(parents=True, exist_ok=True)
-          if not dst.exists():
-              cands = sorted(glob.glob("data/*.csv"))
-              if not cands:
-                  cands = sorted(glob.glob("data_snapshots/*.csv"))
-              if not cands:
-                  raise SystemExit("找不到可用的歷史 CSV 來前日覆寫")
-              src = cands[-1]
-              shutil.copyfile(src, dst)
-              print(f"[copy-forward] {src} -> {dst}")
-          else:
-              print(f"[ok] {dst} 已存在")
-          PY
-
-      - name: Ensure today's prices CSV exists (copy-forward if missing)
-        run: |
-          python - <<'PY'
-          import os, glob, shutil
-          from pathlib import Path
-          d = os.environ["REPORT_DATE"]
-          dst = Path("prices")/f"{d}.csv"
-          dst.parent.mkdir(parents=True, exist_ok=True)
-          if not dst.exists():
-              cands = sorted(glob.glob("prices/*.csv"))
-              if cands:
-                  src = cands[-1]
-                  shutil.copyfile(src, dst)
-                  print(f"[copy-forward] {src} -> {dst}")
-              else:
-                  print("[warn] 沒有任何歷史 prices 可前日覆寫，後續將依 build 的回補機制處理。")
-          else:
-              print(f"[ok] {dst} 已存在")
-          PY
-
-      # ------------------ 去重快照（非交易日不新增快照） ------------------
+      # 只在內容有變化時才產生 snapshot，避免非交易日新增重覆檔
       - name: Update snapshots if changed
         run: |
           python - <<'PY'
