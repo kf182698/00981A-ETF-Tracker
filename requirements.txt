@@ -1,7 +1,7 @@
-selenium
-pandas
-openpyxl
-chromedriver-autoinstaller
-matplotlib
-requests
-sendgrid==6.11.0
+pandas>=2.0
+requests>=2.31
+beautifulsoup4>=4.12
+lxml>=5.0
+openpyxl>=3.1
+yfinance>=0.2
+matplotlib>=3.8
