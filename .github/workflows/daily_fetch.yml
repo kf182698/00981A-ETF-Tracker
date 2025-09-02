@@ -8,7 +8,7 @@ on:
         required: false
         default: ""
   schedule:
-    # UTC 09:10 = 台北 17:10（可依需求調整）
+    # UTC 09:10 = 台北 17:10（平日）
     - cron: "10 9 * * 1-5"
 
 jobs:
@@ -40,7 +40,7 @@ jobs:
           else
             RAW="$(date +'%Y-%m-%d')"
           fi
-          # 轉為 YYYY-MM-DD
+          # 規範為 YYYY-MM-DD
           if [[ "$RAW" =~ ^[0-9]{8}$ ]]; then
             REPORT_DATE="${RAW:0:4}-${RAW:4:2}-${RAW:6:2}"
           else
@@ -49,15 +49,40 @@ jobs:
           echo "REPORT_DATE=$REPORT_DATE" | tee -a $GITHUB_OUTPUT
           echo "REPORT_DATE=$REPORT_DATE" >> $GITHUB_ENV
 
-      - name: Fetch latest XLSX
+      # --- 這段會自動找 fetch_snapshot.py 的實際路徑，再執行 ---
+      - name: Fetch latest XLSX (auto-locate fetch_snapshot.py)
+        shell: bash
         run: |
-          python fetch_snapshot.py
+          set -euo pipefail
+          echo "[debug] repo tree (depth 2)"; find . -maxdepth 2 -type f -name "*.py" -print | sort
+          TARGET="$(git ls-files | grep -E '(^|/ )?fetch_snapshot\.py$' | head -n1 || true)"
+          if [ -z "$TARGET" ]; then
+            TARGET="$(find . -maxdepth 4 -name 'fetch_snapshot.py' | head -n1 || true)"
+          fi
+          if [ -z "$TARGET" ]; then
+            echo "::error::找不到 fetch_snapshot.py。請把它加到 repo，或調整這個步驟的路徑。"
+            exit 1
+          fi
+          echo "[run] python $TARGET"
+          python "$TARGET"
 
-      - name: Convert XLSX -> daily CSV (data/YYYY-MM-DD.csv)
+      # --- 同樣保護 xlsx_to_csv.py ---
+      - name: Convert XLSX -> daily CSV (auto-locate xlsx_to_csv.py)
+        shell: bash
         run: |
-          python xlsx_to_csv.py
+          set -euo pipefail
+          TARGET="$(git ls-files | grep -E '(^|/ )?xlsx_to_csv\.py$' | head -n1 || true)"
+          if [ -z "$TARGET" ]; then
+            TARGET="$(find . -maxdepth 4 -name 'xlsx_to_csv.py' | head -n1 || true)"
+          fi
+          if [ -z "$TARGET" ]; then
+            echo "::error::找不到 xlsx_to_csv.py。請把它加到 repo，或調整這個步驟的路徑。"
+            exit 1
+          fi
+          echo "[run] python $TARGET"
+          python "$TARGET"
 
-      # 只在內容有變化時，才新增一份 snapshot（避免非交易日重算）
+      # 只在內容變更時才新增 snapshot，避免非交易日重算
       - name: Update snapshots if changed
         run: |
           python - <<'PY'
