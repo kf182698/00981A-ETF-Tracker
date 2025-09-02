@@ -38,3 +38,9 @@ jobs:
           name: screenshots
           path: screenshots/
           if-no-files-found: ignore
+          - name: Export prices CSV from Xlsx
+  env:
+    REPORT_DATE: ${{ steps.determine_date.outputs.REPORT_DATE }}
+  run: |
+    python export_prices_from_xlsx.py
+
