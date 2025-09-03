@@ -8,7 +8,7 @@ on:
         required: false
         default: ""
   schedule:
-    # UTC 09:10 ≈ 台北 17:10（工作日）
+    # UTC 09:10 ≈ 台北 17:10（工作日）；依需求調整
     - cron: "10 9 * * 1-5"
 
 jobs:
@@ -31,10 +31,10 @@ jobs:
           python -m pip install -U pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      # 保障：就算 requirements.txt 還沒補齊，也確保爬蟲會動
-      - name: Install scraping deps (bs4 + lxml) & yfinance (fallback)
+      # 保險：就算 requirements.txt 尚未補齊，也確保官網爬蟲可用
+      - name: Install scraping deps (official-only)
         run: |
-          pip install -q --upgrade beautifulsoup4 lxml yfinance || true
+          pip install -q --upgrade beautifulsoup4 lxml
 
       - name: Determine REPORT_DATE
         id: determine_date
@@ -45,7 +45,7 @@ jobs:
           else
             RAW="$(date +'%Y-%m-%d')"
           fi
-          # 規範成 YYYY-MM-DD
+          # 規範為 YYYY-MM-DD
           if [[ "$RAW" =~ ^[0-9]{8}$ ]]; then
             REPORT_DATE="${RAW:0:4}-${RAW:4:2}-${RAW:6:2}"
           else
@@ -54,7 +54,9 @@ jobs:
           echo "REPORT_DATE=$REPORT_DATE" | tee -a $GITHUB_OUTPUT
           echo "REPORT_DATE=$REPORT_DATE" >> $GITHUB_ENV
 
-      - name: Fetch latest XLSX
+      - name: Fetch latest XLSX (official holdings page)
+        env:
+          HOLDINGS_URL: ${{ vars.HOLDINGS_URL || secrets.HOLDINGS_URL }}
         run: |
           python fetch_snapshot.py
 
@@ -64,9 +66,10 @@ jobs:
 
       - name: Build prices CSV (TWSE/TPEx; Yahoo fallback)
         run: |
+          pip install -q yfinance || true
           python build_prices.py
 
-      # 只在內容有變化時才產生 snapshot，避免非交易日新增重覆檔
+      # 僅在內容變化時新增 snapshot，避免非交易日重覆
       - name: Update snapshots if changed
         run: |
           python - <<'PY'
@@ -91,8 +94,7 @@ jobs:
           snaps = sorted(glob.glob("data_snapshots/*.csv"))
           same = False
           if snaps:
-              df_prev = load(snaps[-1])
-              same = df_today.equals(df_prev)
+              df_prev = load(snaps[-1]); same = df_today.equals(df_prev)
           if not same:
               df_today.to_csv(f"data_snapshots/{date}.csv", index=False, encoding="utf-8-sig")
               print("[snapshot] saved data_snapshots/", date)
