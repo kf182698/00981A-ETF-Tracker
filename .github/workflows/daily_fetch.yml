@@ -8,7 +8,7 @@ on:
         required: false
         default: ""
   schedule:
-    # UTC 09:10 ≈ 台北 17:10（工作日）；依需求調整
+    # UTC 09:10 ≈ 台北 17:10（週一至週五）
     - cron: "10 9 * * 1-5"
 
 jobs:
@@ -31,10 +31,10 @@ jobs:
           python -m pip install -U pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      # 保險：就算 requirements.txt 尚未補齊，也確保官網爬蟲可用
-      - name: Install scraping deps (official-only)
+      - name: Install Playwright (headless Chromium)
         run: |
-          pip install -q --upgrade beautifulsoup4 lxml
+          pip install -q playwright
+          python -m playwright install --with-deps chromium
 
       - name: Determine REPORT_DATE
         id: determine_date
@@ -45,7 +45,6 @@ jobs:
           else
             RAW="$(date +'%Y-%m-%d')"
           fi
-          # 規範為 YYYY-MM-DD
           if [[ "$RAW" =~ ^[0-9]{8}$ ]]; then
             REPORT_DATE="${RAW:0:4}-${RAW:4:2}-${RAW:6:2}"
           else
@@ -54,9 +53,7 @@ jobs:
           echo "REPORT_DATE=$REPORT_DATE" | tee -a $GITHUB_OUTPUT
           echo "REPORT_DATE=$REPORT_DATE" >> $GITHUB_ENV
 
-      - name: Fetch latest XLSX (official holdings page)
-        env:
-          HOLDINGS_URL: ${{ vars.HOLDINGS_URL || secrets.HOLDINGS_URL }}
+      - name: Fetch latest XLSX (official download)
         run: |
           python fetch_snapshot.py
 
@@ -69,7 +66,6 @@ jobs:
           pip install -q yfinance || true
           python build_prices.py
 
-      # 僅在內容變化時新增 snapshot，避免非交易日重覆
       - name: Update snapshots if changed
         run: |
           python - <<'PY'
