@@ -31,11 +31,6 @@ jobs:
           python -m pip install -U pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Install Playwright (headless Chromium)
-        run: |
-          pip install -q playwright
-          python -m playwright install --with-deps chromium
-
       - name: Determine REPORT_DATE
         id: determine_date
         shell: bash
@@ -53,7 +48,7 @@ jobs:
           echo "REPORT_DATE=$REPORT_DATE" | tee -a $GITHUB_OUTPUT
           echo "REPORT_DATE=$REPORT_DATE" >> $GITHUB_ENV
 
-      - name: Fetch latest XLSX (official download)
+      - name: Fetch latest XLSX (official API)
         run: |
           python fetch_snapshot.py
 
@@ -116,4 +111,3 @@ jobs:
           else
             git commit -m "Daily update: ${REPORT_DATE}"
             git push
-          fi
