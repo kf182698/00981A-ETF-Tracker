@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       report_date:
-        description: "指定日期 (YYYY-MM-DD 或 YYYYMMDD)，留空則用台北今天"
+        description: "指定日期 (YYYY-MM-DD 或 YYYYMMDD)，留空則用台北前一個工作日"
         required: false
         default: ""
   schedule:
-    # UTC 09:10 ≈ 台北 17:10（週一至週五）
+    # UTC 09:10 = 台北 17:10（週一到週五）
     - cron: "10 9 * * 1-5"
 
 jobs:
@@ -36,14 +36,17 @@ jobs:
           pip install -q playwright
           python -m playwright install --with-deps chromium
 
-      - name: Determine REPORT_DATE
+      - name: Determine REPORT_DATE  # ← 改這一步
         id: determine_date
         shell: bash
         run: |
           if [ -n "${{ github.event.inputs.report_date }}" ]; then
             RAW="${{ github.event.inputs.report_date }}"
           else
-            RAW="$(date +'%Y-%m-%d')"
+            # 台北前一個「工作日」：週一回跳 3 天、其他回跳 1 天
+            DOW=$(date +%u)  # 1=Mon ... 7=Sun
+            if [ "$DOW" -eq 1 ]; then OFF=3; else OFF=1; fi
+            RAW="$(date -d "-${OFF} day" +'%Y-%m-%d')"
           fi
           if [[ "$RAW" =~ ^[0-9]{8}$ ]]; then
             REPORT_DATE="${RAW:0:4}-${RAW:4:2}-${RAW:6:2}"
@@ -53,13 +56,11 @@ jobs:
           echo "REPORT_DATE=$REPORT_DATE" | tee -a $GITHUB_OUTPUT
           echo "REPORT_DATE=$REPORT_DATE" >> $GITHUB_ENV
 
-      - name: Fetch latest XLSX (official browser download)
-        run: |
-          python fetch_snapshot.py
+      - name: Fetch latest snapshot
+        run: python fetch_snapshot.py
 
-      - name: Convert XLSX -> daily CSV (data/YYYY-MM-DD.csv)
-        run: |
-          python xlsx_to_csv.py
+      - name: Convert XLSX -> daily CSV
+        run: python xlsx_to_csv.py
 
       - name: Build prices CSV (TWSE/TPEx; Yahoo fallback)
         run: |
@@ -99,12 +100,10 @@ jobs:
           PY
 
       - name: Build change table + summary
-        run: |
-          python build_change_table.py
+        run: python build_change_table.py
 
       - name: Generate charts
-        run: |
-          python charts.py
+        run: python charts.py
 
       - name: Commit & push
         run: |
