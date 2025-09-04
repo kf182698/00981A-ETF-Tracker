@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       report_date:
-        description: "指定日期 (YYYY-MM-DD 或 YYYYMMDD)，留空則用台北前一個工作日"
+        description: "指定日期 (YYYY-MM-DD 或 YYYYMMDD)，留空則用台北前一工作日"
         required: false
         default: ""
   schedule:
@@ -26,24 +26,20 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Install base dependencies
+      - name: Install dependencies
         run: |
           python -m pip install -U pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-
-      - name: Install Playwright (headless Chromium)
-        run: |
           pip install -q playwright
           python -m playwright install --with-deps chromium
 
-      - name: Determine REPORT_DATE  # ← 改這一步
+      - name: Determine REPORT_DATE (前一工作日作為預設)
         id: determine_date
         shell: bash
         run: |
           if [ -n "${{ github.event.inputs.report_date }}" ]; then
             RAW="${{ github.event.inputs.report_date }}"
           else
-            # 台北前一個「工作日」：週一回跳 3 天、其他回跳 1 天
             DOW=$(date +%u)  # 1=Mon ... 7=Sun
             if [ "$DOW" -eq 1 ]; then OFF=3; else OFF=1; fi
             RAW="$(date -d "-${OFF} day" +'%Y-%m-%d')"
@@ -55,17 +51,37 @@ jobs:
           fi
           echo "REPORT_DATE=$REPORT_DATE" | tee -a $GITHUB_OUTPUT
           echo "REPORT_DATE=$REPORT_DATE" >> $GITHUB_ENV
+          echo "[workflow] initial REPORT_DATE=$REPORT_DATE"
 
-      - name: Fetch latest snapshot
+      - name: Fetch latest snapshot (官網)
         run: python fetch_snapshot.py
+
+      - name: Override REPORT_DATE with effective date from site
+        shell: bash
+        run: |
+          if [ -f manifest/effective_date.txt ]; then
+            EFFECTIVE_DATE="$(cat manifest/effective_date.txt)"
+            echo "REPORT_DATE=$EFFECTIVE_DATE" | tee -a $GITHUB_ENV
+            echo "[workflow] REPORT_DATE overridden to $EFFECTIVE_DATE"
+          else
+            echo "[workflow] manifest/effective_date.txt not found; keep REPORT_DATE=$REPORT_DATE"
+          fi
 
       - name: Convert XLSX -> daily CSV
         run: python xlsx_to_csv.py
 
-      - name: Build prices CSV (TWSE/TPEx; Yahoo fallback)
+      # 若你用 export_prices_from_xlsx.py 來補 with_prices，可保留；若用其他腳本請自行替換
+      - name: Export/merge prices into with_prices (optional)
+        continue-on-error: true
         run: |
-          pip install -q yfinance || true
-          python build_prices.py
+          if [ -f export_prices_from_xlsx.py ]; then
+            python export_prices_from_xlsx.py || true
+          elif [ -f build_prices.py ]; then
+            pip install -q yfinance || true
+            python build_prices.py || true
+          else
+            echo "no price script; skip"
+          fi
 
       - name: Update snapshots if changed
         run: |
@@ -73,23 +89,39 @@ jobs:
           import glob, os
           from pathlib import Path
           import pandas as pd
+
           date = os.environ["REPORT_DATE"]
           today = Path("data")/f"{date}.csv"
           Path("data_snapshots").mkdir(exist_ok=True)
+
           if not today.exists():
               raise SystemExit(f"missing {today}")
+
           def load(p):
               df = pd.read_csv(p, encoding="utf-8-sig")
-              cols = [c for c in ["股票代號","股票名稱","股數","持股權重"] if c in df.columns]
-              df = df[cols].copy()
-              df["股票代號"] = df["股票代號"].astype(str).str.strip()
-              df["股票名稱"] = df["股票名稱"].astype(str).str.strip()
-              df["股數"] = pd.to_numeric(df["股數"], errors="coerce").fillna(0).astype(int)
-              df["持股權重"] = pd.to_numeric(df["持股權重"], errors="coerce").fillna(0.0).round(6)
-              return df.sort_values(["股票代號"]).reset_index(drop=True)
+              # 標準欄位
+              rename = {}
+              for c in df.columns:
+                  s=str(c)
+                  if any(k in s for k in ["股票代號","證券代號","股票代碼","代號"]): rename[c]="股票代號"
+                  elif any(k in s for k in ["股票名稱","個股名稱","名稱"]): rename[c]="股票名稱"
+                  elif any(k in s for k in ["持股權重","投資比例","比重","權重"]): rename[c]="持股權重"
+                  elif any(k in s for k in ["股數","持有股數"]): rename[c]="股數"
+              if rename: df=df.rename(columns=rename)
+
+              for col in ["股數","持股權重"]:
+                  if col not in df.columns: df[col]=0
+              # 數字清洗
+              df["股數"]=pd.to_numeric(df["股數"].astype(str).str.replace(",","",regex=False), errors="coerce").fillna(0).astype(int)
+              df["持股權重"]=pd.to_numeric(df["持股權重"].astype(str).str.replace(",","",regex=False).str.replace("%","",regex=False), errors="coerce").fillna(0.0).round(6)
+              df["股票代號"]=df["股票代號"].astype(str).str.extract(r"([1-9]\d{3})", expand=False)
+              df["股票名稱"]=df.get("股票名稱","").astype(str).str.strip()
+              df=df[["股票代號","股票名稱","股數","持股權重"]].dropna(subset=["股票代號"]).sort_values("股票代號").reset_index(drop=True)
+              return df
+
           df_today = load(today)
           snaps = sorted(glob.glob("data_snapshots/*.csv"))
-          same = False
+          same=False
           if snaps:
               df_prev = load(snaps[-1]); same = df_today.equals(df_prev)
           if not same:
