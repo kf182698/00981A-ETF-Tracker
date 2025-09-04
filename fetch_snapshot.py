@@ -1,4 +1,4 @@
-# fetch_snapshot.py — 用 Playwright 模擬瀏覽器下載官方 XLSX（多重保險，確保拿到檔案）
+# fetch_snapshot.py — 用 Playwright 模擬瀏覽器下載官方 XLSX（修正版：用 context.wait_for_event 捕捉 response）
 import os, re, io
 from pathlib import Path
 from datetime import datetime
@@ -15,17 +15,11 @@ def _date_str() -> str:
     return datetime.now().strftime("%Y-%m-%d")
 
 def _save_to_xlsx_bytes(content: bytes, out_xlsx: Path):
-    """
-    將官方下載內容（xlsx 或 csv）讀入 DataFrame，標準化欄位，最後輸出成
-    archive/YYYY-MM/ETF_Investment_Portfolio_YYYYMMDD.xlsx
-    （含 holdings 與 with_prices 兩張工作表）
-    """
-    # 嘗試 xlsx（OpenXML ZIP 的魔術字頭 PK\x03\x04）
-    df = None
+    # 嘗試 xlsx（OpenXML ZIP 魔術字頭 PK\x03\x04），否則以多編碼讀 CSV
     if content[:4] == b"PK\x03\x04":
         df = pd.read_excel(io.BytesIO(content), engine="openpyxl", dtype={"股票代號": str})
     else:
-        # 可能是 CSV（UTF-8/Big5）
+        df = None
         for enc in ("utf-8-sig", "utf-8", "cp950", "big5-hkscs"):
             try:
                 df = pd.read_csv(io.BytesIO(content), encoding=enc, dtype={"股票代號": str})
@@ -33,7 +27,6 @@ def _save_to_xlsx_bytes(content: bytes, out_xlsx: Path):
             except Exception:
                 continue
         if df is None:
-            # 有些站會回 HTML；此處不再嘗試解析 HTML，直接丟錯，避免誤判
             raise SystemExit("官方下載回應非有效檔案（非 XLSX/CSV）。")
 
     # 欄位標準化
@@ -45,7 +38,6 @@ def _save_to_xlsx_bytes(content: bytes, out_xlsx: Path):
         elif any(k in s for k in ["持股權重","投資比例","比重","權重"]):     rename[c] = "持股權重"
         elif any(k in s for k in ["股數","持有股數"]):                      rename[c] = "股數"
     if rename: df.rename(columns=rename, inplace=True)
-
     cols = [c for c in ["股票代號","股票名稱","股數","持股權重"] if c in df.columns]
     if not cols:
         raise SystemExit("下載檔案中沒有可辨識欄位。")
@@ -53,7 +45,6 @@ def _save_to_xlsx_bytes(content: bytes, out_xlsx: Path):
 
     if "股票代號" not in df.columns and "股票名稱" in df.columns:
         df["股票代號"] = df["股票名稱"].astype(str).str.extract(r"(\d{4})", expand=False)
-
     if "股票名稱" in df.columns:
         df["股票名稱"] = df["股票名稱"].astype(str).str.replace(r"\(\d{4}\)","",regex=True).str.strip()
     if "股數" in df.columns:
@@ -84,16 +75,7 @@ def fetch_snapshot():
         page = ctx.new_page()
         page.goto(INFO_URL, wait_until="domcontentloaded", timeout=60000)
 
-        # 若有分頁/頁籤，先切到「持股明細」之類的 tab（容錯）
-        for tab_text in ["持股", "持股明細", "成分股", "投資組合"]:
-            try:
-                if page.locator(f'text="{tab_text}"').count() > 0:
-                    page.locator(f'text="{tab_text}"').first.click(timeout=2000)
-                    break
-            except Exception:
-                pass
-
-        # 1) 嘗試直接讀取連結 href
+        # 嘗試先找到直接的下載 href
         href = None
         for sel in [
             'a:has-text("下載")',
@@ -105,59 +87,72 @@ def fetch_snapshot():
             try:
                 loc = page.locator(sel).first
                 if loc.count() > 0:
-                    # 有些是 <a href="...xlsx">下載</a>
                     h = loc.get_attribute("href")
                     if h and h != "javascript:void(0)":
                         href = h
                         break
             except Exception:
                 continue
+
         if href and href.startswith("/"):
             href = "https://www.ezmoney.com.tw" + href
 
-        # 2) 先走 download event 與 response 監聽（雙保險）
         content_bytes = None
-        if not href:
-            try:
-                with page.expect_download(timeout=45000) as dl_info:
-                    # 可能的真按鈕
-                    clicked = False
-                    for sel in [
-                        'a:has-text("下載")',
-                        'button:has-text("下載")',
-                        'text=下載'
-                    ]:
-                        if page.locator(sel).count() > 0:
-                            page.locator(sel).first.click()
-                            clicked = True
-                            break
-                    if not clicked:
-                        # 若前面沒找到，嘗試任何包含 Download 的連結
-                        if page.locator('a[href*="Download"]').count() > 0:
-                            page.locator('a[href*="Download"]').first.click()
-                            clicked = True
-                    if not clicked:
-                        raise PWTimeout("找不到可點擊的下載按鈕")
-                download = dl_info.value
-                content_bytes = download.content()
-            except PWTimeout:
-                # 改為等回應（API 下載）
-                try:
-                    resp = page.wait_for_response(lambda r: "Download" in r.url and ("fundCode=49YTW" in r.url or r.url.endswith((".xlsx",".csv"))), timeout=45000)
-                    href = resp.url
-                except PWTimeout:
-                    pass
 
-        # 3) 若拿到 href，用同一個 context 的 request 抓檔（保留 cookie/headers）
-        if content_bytes is None and href:
+        # A) 有 href：直接用同一個 context 的 request 取檔（保留 cookie/headers）
+        if href:
             r = ctx.request.get(href, headers={"Referer": INFO_URL})
             if not r.ok:
                 raise SystemExit(f"下載失敗：{r.status} {r.status_text()}")
             content_bytes = r.body()
+        else:
+            # B) 沒有 href：點擊「下載」，用 context.wait_for_event('response') 捕捉 Download API
+            # 先嘗試觸發按鈕
+            clicked = False
+            for sel in ['a:has-text("下載")','button:has-text("下載")','text=下載']:
+                try:
+                    if page.locator(sel).count() > 0:
+                        page.locator(sel).first.click()
+                        clicked = True
+                        break
+                except Exception:
+                    continue
+            if not clicked and page.locator('a[href*="Download"]').count() > 0:
+                page.locator('a[href*="Download"]').first.click()
+                clicked = True
+
+            if not clicked:
+                browser.close()
+                raise SystemExit("找不到可點擊的下載按鈕")
+
+            # 等待符合條件的回應
+            try:
+                resp = ctx.wait_for_event(
+                    "response",
+                    predicate=lambda r: (
+                        "Download" in r.url
+                        and ("fundCode=49YTW" in r.url or r.url.endswith((".xlsx", ".csv")))
+                        and r.status == 200
+                    ),
+                    timeout=45000
+                )
+                content_bytes = resp.body()
+            except PWTimeout:
+                # 某些站觸發原生下載（非 XHR），改用 download 事件當後備
+                try:
+                    with page.expect_download(timeout=20000) as dl_info:
+                        # 再點一次
+                        if page.locator('text=下載').count() > 0:
+                            page.locator('text=下載').first.click()
+                    download = dl_info.value
+                    content_bytes = download.content()
+                except PWTimeout:
+                    browser.close()
+                    raise SystemExit("等待下載/回應逾時，可能頁面流程已變更。")
 
         browser.close()
 
-    if content_bytes is None or len(content_bytes) < 200:  # 太小多半是錯誤頁
+    if content_bytes is None or len(content_bytes) < 200:
         raise SystemExit("官方下載回應非有效資料表（可能為 HTML 錯誤頁或格式變動）。")
 
     rows = _save_to_xlsx_bytes(content_bytes, out_xlsx)
