@@ -28,11 +28,15 @@ def _out_path(date_str: str) -> Path:
     return outdir / f"ETF_Investment_Portfolio_{yyyymmdd}.xlsx"
 
 # ---------- 內容整理（XLSX/CSV/HTML 轉 DataFrame） ----------
-def _normalize(df: pd.DataFrame) -> pd.DataFrame:
-    # 攤平成單層欄
+def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = ["".join([str(x) for x in tup if str(x) != "nan"]).strip() for tup in df.columns.values]
     df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+def _normalize(df: pd.DataFrame) -> pd.DataFrame:
+    df = _flatten_columns(df.copy())
+
     # 欄位映射
     rename = {}
     for c in df.columns:
@@ -41,29 +45,55 @@ def _normalize(df: pd.DataFrame) -> pd.DataFrame:
         elif any(k in s for k in ["股票名稱","個股名稱","名稱"]):          rename[c] = "股票名稱"
         elif any(k in s for k in ["持股權重","投資比例","比重","權重"]):     rename[c] = "持股權重"
         elif any(k in s for k in ["股數","持有股數"]):                      rename[c] = "股數"
-    if rename: df.rename(columns=rename, inplace=True)
+    if rename:
+        df.rename(columns=rename, inplace=True)
 
-    cols = [c for c in ["股票代號","股票名稱","股數","持股權重"] if c in df.columns]
-    if not cols:
+    # 至少要有名稱或代號其中一項；沒有就直接回空表
+    if "股票代號" not in df.columns and "股票名稱" not in df.columns:
         return pd.DataFrame(columns=["股票代號","股票名稱","股數","持股權重"])
-    df = df[cols].copy()
 
-    if "股票代號" not in df.columns and "股票名稱" in df.columns:
-        df["股票代號"] = df["股票名稱"].astype(str).str.extract(r"(\d{4})", expand=False)
+    # 嘗試補出 4 碼代號
+    if "股票代號" not in df.columns:
+        # 先從名稱萃取 (2330)
+        if "股票名稱" in df.columns:
+            codes = df["股票名稱"].astype(str).str.extract(r"(\d{4})", expand=False)
+            df["股票代號"] = codes
+        # 仍沒有就從所有欄位掃一次（常見情況：名稱列印了「台積電2330」）
+        if "股票代號" not in df.columns or df["股票代號"].isna().all():
+            any_text = df.astype(str).agg(" ".join, axis=1)
+            df["股票代號"] = any_text.str.extract(r"(\b\d{4}\b)", expand=False)
 
+    # 清洗欄位值（僅在欄位存在時執行，不做強制索引）
     if "股票名稱" in df.columns:
         df["股票名稱"] = df["股票名稱"].astype(str).str.replace(r"\(\d{4}\)","",regex=True).str.strip()
+
     if "股數" in df.columns:
         df["股數"] = pd.to_numeric(df["股數"], errors="coerce").fillna(0).astype(int)
+    else:
+        df["股數"] = 0
+
     if "持股權重" in df.columns:
         df["持股權重"] = pd.to_numeric(df["持股權重"], errors="coerce").fillna(0.0)
+    else:
+        df["持股權重"] = 0.0
+
+    # 最後整理「股票代號」；若仍全 NA，直接回空表避免 KeyError
+    if "股票代號" not in df.columns:
+        return pd.DataFrame(columns=["股票代號","股票名稱","股數","持股權重"])
 
     df["股票代號"] = df["股票代號"].astype(str).str.extract(r"(\d{4})", expand=False)
-    df = df.dropna(subset=["股票代號"]).drop_duplicates("股票代號").sort_values("股票代號").reset_index(drop=True)
+    df = df.dropna(subset=["股票代號"])
+
+    # 確保有名稱欄
+    if "股票名稱" not in df.columns:
+        df["股票名稱"] = ""
+
+    df = df[["股票代號","股票名稱","股數","持股權重"]].drop_duplicates("股票代號")
+    df = df.sort_values("股票代號").reset_index(drop=True)
     return df
 
 def _save_xlsx(df: pd.DataFrame, out_xlsx: Path) -> int:
-    if df.empty:
+    if df is None or df.empty:
         raise SystemExit("官方頁仍未取得任何有效持股列。")
     with pd.ExcelWriter(out_xlsx, engine="openpyxl") as w:
         df.to_excel(w, sheet_name="holdings", index=False)
@@ -72,16 +102,16 @@ def _save_xlsx(df: pd.DataFrame, out_xlsx: Path) -> int:
     return len(df)
 
 def _bytes_to_df(content: bytes) -> pd.DataFrame | None:
-    # XLSX（OpenXML zip 魔術字頭）
+    # XLSX（OpenXML zip）
     if content[:4] == b"PK\x03\x04":
         try:
-            return _normalize(pd.read_excel(io.BytesIO(content), engine="openpyxl", dtype={"股票代號": str}))
+            return _normalize(pd.read_excel(io.BytesIO(content), engine="openpyxl", dtype=str))
         except Exception:
             pass
     # CSV 編碼嘗試
     for enc in ("utf-8-sig","utf-8","cp950","big5-hkscs"):
         try:
-            return _normalize(pd.read_csv(io.BytesIO(content), encoding=enc, dtype={"股票代號": str}))
+            return _normalize(pd.read_csv(io.BytesIO(content), encoding=enc, dtype=str))
         except Exception:
             continue
     return None
@@ -89,7 +119,7 @@ def _bytes_to_df(content: bytes) -> pd.DataFrame | None:
 def _html_to_df(html: str) -> pd.DataFrame:
     soup = BeautifulSoup(html, "lxml")
     candidates = []
-    # 把頁面所有 table 丟給 pandas
+    # 個別 table
     for t in soup.find_all("table"):
         try:
             for df in pd.read_html(io.StringIO(str(t))):
@@ -102,18 +132,18 @@ def _html_to_df(html: str) -> pd.DataFrame:
             candidates.append(df)
     except Exception:
         pass
-    # 遴選最像持股表的一張
+
+    # 遴選最像持股表的一張（normalize 後非空即採用）
     for df in candidates:
         df2 = _normalize(df)
-        if not df2.empty and {"股票代號","股票名稱"}.issubset(df2.columns):
-            # 至少要有名稱，且有股數或權重其中之一
-            if ("股數" in df2.columns) or ("持股權重" in df2.columns):
-                return df2
+        # 至少要有代號與名稱其中之一，且有股數或權重任一欄即算有效
+        if not df2.empty and (("股數" in df2.columns) or ("持股權重" in df2.columns)):
+            return df2
+
     return pd.DataFrame(columns=["股票代號","股票名稱","股數","持股權重"])
 
 # ---------- Playwright 下載（含 iframe 與彈窗處理） ----------
 def _try_click_download_and_capture(page, ctx, timeout_ms=120000) -> bytes | None:
-    # 加強等待，盡量讓表格渲染完成
     try:
         page.wait_for_load_state("networkidle", timeout=30000)
     except Exception:
@@ -150,7 +180,7 @@ def _try_click_download_and_capture(page, ctx, timeout_ms=120000) -> bytes | Non
         href = "https://www.ezmoney.com.tw" + href
     if href:
         r = ctx.request.get(href, headers={"Referer": INFO_URL})
-        if r.ok:
+        if r.ok and len(r.body()) > 200:
             return r.body()
 
     # 沒有直接 href：點擊並等 response 或原生下載
@@ -169,41 +199,26 @@ def _try_click_download_and_capture(page, ctx, timeout_ms=120000) -> bytes | Non
         if key in seen: continue
         seen.add(key)
         try:
-            # 先掛 response 監聽
-            resp = None
+            # 先點
+            f.locator(sel).first.click(timeout=2000)
+            # 等情境層 response
             try:
                 resp = ctx.wait_for_event(
                     "response",
                     predicate=lambda r: ("Download" in r.url and ("fundCode=49YTW" in r.url or r.url.endswith((".xlsx",".csv")))) and r.status == 200,
                     timeout=timeout_ms
                 )
-            except PWTimeout:
-                resp = None
-
-            f.locator(sel).first.click(timeout=2000)
-
-            if resp is None:
-                try:
-                    resp = ctx.wait_for_event(
-                        "response",
-                        predicate=lambda r: ("Download" in r.url and ("fundCode=49YTW" in r.url or r.url.endswith((".xlsx",".csv")))) and r.status == 200,
-                        timeout=timeout_ms
-                    )
-                except PWTimeout:
-                    # 原生下載後備
-                    try:
-                        with f.page.expect_download(timeout=20000) as dl_info:
-                            try: f.locator(sel).first.click(timeout=1000)
-                            except Exception: pass
-                        download = dl_info.value
-                        return download.content()
-                    except PWTimeout:
-                        continue
-
-            if resp:
-                try:
+                if resp and len(resp.body()) > 200:
                     return resp.body()
-                except Exception:
+            except PWTimeout:
+                # 原生下載後備
+                try:
+                    with f.page.expect_download(timeout=20000) as dl_info:
+                        try: f.locator(sel).first.click(timeout=1000)
+                        except Exception: pass
+                    download = dl_info.value
+                    return download.content()
+                except PWTimeout:
                     continue
         except Exception:
             continue
@@ -265,7 +280,6 @@ def fetch_snapshot():
         if content is None:
             content = _fallback_download_with_cookies(ctx)
 
-        # 關閉瀏覽器（DOM 解析用的是 html_snapshot，不再依賴 page 狀態）
         browser.close()
 
     # 嘗試把 bytes 直接變成 DF
