@@ -1,7 +1,12 @@
-# fetch_snapshot.py — 修正：嚴格挑選成分股表 + 僅接受 [1-9]\d{3} 代號 + 以頁面「資料日期」命名
+# fetch_snapshot.py — 00981A 官方頁抓檔
+# 流程：下載連結 → 事件/回應 → cookies 直打 API → DOM 表備援
+# 產出：archive/YYYY-MM/ETF_Investment_Portfolio_YYYYMMDD.xlsx
+# 工作表：holdings（整理後）、with_prices（同資料多一欄「收盤價」留空）
+
 import os, re, io, json
 from pathlib import Path
 from datetime import datetime
+
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
@@ -11,8 +16,10 @@ INFO_URL = "https://www.ezmoney.com.tw/ETF/Fund/Info?fundCode=49YTW"
 DOWNLOAD_API = "https://www.ezmoney.com.tw/ETF/Fund/DownloadHoldingFile?fundCode=49YTW"
 ARCHIVE = Path("archive")
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
+CODE_RE = re.compile(r"([1-9]\d{3})")  # 僅接受 1000-9999，避免 00981A 被誤抓成 0098
+EXCLUDE_TITLES = {"基金資產","項目","現金","期貨保證金","申贖應付款","應收付證券款"}
 
-# -------- 日期：以頁面資料日期優先，否則用 REPORT_DATE（workflow 已設為前一工作日）
+# ------------------ 日期處理 ------------------
 def _date_str_default() -> str:
     raw = (os.getenv("REPORT_DATE") or "").strip()
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw): return raw
@@ -34,9 +41,7 @@ def _out_path(date_str: str) -> Path:
     outdir.mkdir(parents=True, exist_ok=True)
     return outdir / f"ETF_Investment_Portfolio_{yyyymmdd}.xlsx"
 
-# -------- 欄位標準化（只在欄存在時清洗；股票代號只接受 [1-9]\d{3}）
-CODE_RE = re.compile(r"([1-9]\d{3})")
-
+# ------------------ 欄位標準化 ------------------
 def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = ["".join([str(x) for x in tup if str(x) != "nan"]).strip() for tup in df.columns.values]
@@ -46,6 +51,7 @@ def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
 def _normalize(df: pd.DataFrame) -> pd.DataFrame:
     df = _flatten_columns(df.copy())
 
+    # 欄位映射
     rename = {}
     for c in df.columns:
         s = str(c)
@@ -68,73 +74,45 @@ def _normalize(df: pd.DataFrame) -> pd.DataFrame:
             any_text = df.astype(str).agg(" ".join, axis=1)
             df["股票代號"] = any_text.str.extract(CODE_RE, expand=False)
 
+    # 清洗
     if "股票名稱" in df.columns:
         df["股票名稱"] = df["股票名稱"].astype(str).str.replace(r"\(\d{4}\)","",regex=True).str.strip()
     else:
         df["股票名稱"] = ""
 
-    if "股數" in df.columns:
+    has_shares = "股數" in df.columns
+    has_weight = "持股權重" in df.columns
+
+    if has_shares:
         df["股數"] = pd.to_numeric(df["股數"], errors="coerce").fillna(0).astype(int)
     else:
         df["股數"] = 0
 
-    if "持股權重" in df.columns:
+    if has_weight:
         df["持股權重"] = pd.to_numeric(df["持股權重"], errors="coerce").fillna(0.0)
     else:
         df["持股權重"] = 0.0
 
+    # 只有股數、沒有權重 → 以股數占比回推權重（避免整排 0）
+    if has_shares and not has_weight and df["股數"].sum() > 0:
+        total = df["股數"].sum()
+        df["持股權重"] = (df["股數"] / total * 100).round(6)
+
+    # 最終代號清洗與輸出
     df["股票代號"] = df["股票代號"].astype(str).str.extract(CODE_RE, expand=False)
     df = df.dropna(subset=["股票代號"]).drop_duplicates("股票代號").sort_values("股票代號").reset_index(drop=True)
     return df[["股票代號","股票名稱","股數","持股權重"]]
 
-# -------- DOM 表挑選：必須「像成分股表」
-EXCLUDE_TITLES = {"基金資產","項目","現金","期貨保證金","申贖應付款","應收付證券款"}
-
 def _looks_like_holdings(df: pd.DataFrame) -> bool:
     cols = [str(c) for c in df.columns]
-    # 頭欄出現 EXCLUDE 關鍵字的，直接排除（總覽表）
     if any(any(k in str(c) for k in EXCLUDE_TITLES) for c in cols):
         return False
-    # 欄名有「股票代號/證券代號」直接通過
     if any(any(k in c for k in ["股票代號","證券代號","股票代碼"]) for c in cols):
         return True
-    # 否則檢查內容：若一張表能找到 >= 5 個 [1-9]\d{3} 的代號，視為成分股表
     sample = df.astype(str).agg(" ".join, axis=1).str.extractall(CODE_RE)
     return sample.size >= 5
 
-def _html_to_df(html: str) -> pd.DataFrame:
-    soup = BeautifulSoup(html, "lxml")
-    candidates = []
-    # 個別 table
-    for t in soup.find_all("table"):
-        try:
-            for df in pd.read_html(io.StringIO(str(t))):
-                candidates.append(df)
-        except Exception:
-            continue
-    # 全頁備援
-    try:
-        for df in pd.read_html(io.StringIO(html)):
-            candidates.append(df)
-    except Exception:
-        pass
-
-    # 嚴格挑選最像成分股表的一張
-    best = None
-    best_score = -1
-    for raw in candidates:
-        if not _looks_like_holdings(raw):
-            continue
-        df = _normalize(raw)
-        if df.empty: 
-            continue
-        # 用股票列數當分數
-        score = len(df)
-        if score > best_score:
-            best_score, best = score, df
-    return best if best is not None else pd.DataFrame(columns=["股票代號","股票名稱","股數","持股權重"])
-
-# -------- XLSX/CSV bytes 轉 DataFrame
+# ------------------ 各型資料轉 DF ------------------
 def _bytes_to_df(content: bytes) -> pd.DataFrame | None:
     if content[:4] == b"PK\x03\x04":  # xlsx
         try:
@@ -148,6 +126,36 @@ def _bytes_to_df(content: bytes) -> pd.DataFrame | None:
             continue
     return None
 
+def _html_to_df(html: str) -> pd.DataFrame:
+    soup = BeautifulSoup(html, "lxml")
+    candidates = []
+    for t in soup.find_all("table"):
+        try:
+            for df in pd.read_html(io.StringIO(str(t))):
+                candidates.append(df)
+        except Exception:
+            continue
+    try:
+        for df in pd.read_html(io.StringIO(html)):
+            candidates.append(df)
+    except Exception:
+        pass
+
+    best, best_score = None, -1
+    for raw in candidates:
+        if not _looks_like_holdings(raw):
+            continue
+        df = _normalize(raw)
+        if df.empty: 
+            continue
+        if (df["持股權重"].sum() == 0) and (df["股數"].sum() == 0):
+            continue
+        score = len(df)
+        if score > best_score:
+            best_score, best = score, df
+    return best if best is not None else pd.DataFrame(columns=["股票代號","股票名稱","股數","持股權重"])
+
+# ------------------ 存檔 ------------------
 def _save_xlsx(df: pd.DataFrame, out_xlsx: Path) -> int:
     if df.empty:
         raise SystemExit("仍未取得任何有效持股列。")
@@ -157,23 +165,22 @@ def _save_xlsx(df: pd.DataFrame, out_xlsx: Path) -> int:
         df2.to_excel(w, sheet_name="with_prices", index=False)
     return len(df)
 
-# -------- 下載流程（同前一版，略）
+# ------------------ 抓檔（多層保險） ------------------
 def _try_click_download_and_capture(page, ctx, timeout_ms=120000) -> bytes | None:
     try: page.wait_for_load_state("networkidle", timeout=30000)
     except Exception: pass
 
-    # 先找直接 href
+    # 直接 href
     href = None
-    for sel in ['a[href*="Download"]']:
-        try:
-            loc = page.locator(sel).first
-            if loc.count() > 0:
-                h = loc.get_attribute("href")
-                if h and h != "javascript:void(0)": href = h; break
-        except Exception:
-            pass
-    if href and href.startswith("/"):
-        href = "https://www.ezmoney.com.tw" + href
+    try:
+        loc = page.locator('a[href*="Download"]').first
+        if loc.count() > 0:
+            h = loc.get_attribute("href")
+            if h and h != "javascript:void(0)":
+                href = h
+    except Exception:
+        pass
+    if href and href.startswith("/"): href = "https://www.ezmoney.com.tw" + href
     if href:
         r = ctx.request.get(href, headers={"Referer": INFO_URL})
         if r.ok and len(r.body()) > 200:
@@ -220,9 +227,9 @@ def _fallback_download_with_cookies(ctx) -> bytes | None:
         pass
     return None
 
-# -------- 主程式
+# ------------------ 主程式 ------------------
 def fetch_snapshot():
-    # 先以 workflow 設的 REPORT_DATE 當預設，稍後若頁面有「資料日期」再覆蓋
+    # 預設用 workflow 給的 REPORT_DATE；稍後若頁面有「資料日期」再覆蓋
     effective_date = _date_str_default()
     out_xlsx = _out_path(effective_date)
 
