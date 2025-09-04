@@ -1,7 +1,7 @@
-# fetch_snapshot.py — 00981A 官方頁抓檔
-# 流程：下載連結 → 事件/回應 → cookies 直打 API → DOM 表備援
+# fetch_snapshot.py — 00981A 官方頁抓檔（下載優先，DOM 備援；日期以官網為準）
 # 產出：archive/YYYY-MM/ETF_Investment_Portfolio_YYYYMMDD.xlsx
 # 工作表：holdings（整理後）、with_prices（同資料多一欄「收盤價」留空）
+# 另外寫入：manifest/effective_date.txt 供 workflow 覆寫 REPORT_DATE
 
 import os, re, io, json
 from pathlib import Path
@@ -41,12 +41,27 @@ def _out_path(date_str: str) -> Path:
     outdir.mkdir(parents=True, exist_ok=True)
     return outdir / f"ETF_Investment_Portfolio_{yyyymmdd}.xlsx"
 
-# ------------------ 欄位標準化 ------------------
+# ------------------ 欄位/數字標準化 ------------------
 def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = ["".join([str(x) for x in tup if str(x) != "nan"]).strip() for tup in df.columns.values]
     df.columns = [str(c).strip() for c in df.columns]
     return df
+
+def _numify(series: pd.Series, as_int: bool = False) -> pd.Series:
+    s = (
+        series.astype(str)
+        .str.replace(",", "", regex=False)
+        .str.replace("%", "", regex=False)
+        .str.strip()
+        .replace({"": None})
+    )
+    out = pd.to_numeric(s, errors="coerce")
+    if as_int:
+        out = out.fillna(0).astype(int)
+    else:
+        out = out.fillna(0.0)
+    return out
 
 def _normalize(df: pd.DataFrame) -> pd.DataFrame:
     df = _flatten_columns(df.copy())
@@ -80,21 +95,18 @@ def _normalize(df: pd.DataFrame) -> pd.DataFrame:
     else:
         df["股票名稱"] = ""
 
-    has_shares = "股數" in df.columns
-    has_weight = "持股權重" in df.columns
-
-    if has_shares:
-        df["股數"] = pd.to_numeric(df["股數"], errors="coerce").fillna(0).astype(int)
+    if "股數" in df.columns:
+        df["股數"] = _numify(df["股數"], as_int=True)
     else:
         df["股數"] = 0
 
-    if has_weight:
-        df["持股權重"] = pd.to_numeric(df["持股權重"], errors="coerce").fillna(0.0)
+    if "持股權重" in df.columns:
+        df["持股權重"] = _numify(df["持股權重"], as_int=False)
     else:
         df["持股權重"] = 0.0
 
-    # 只有股數、沒有權重 → 以股數占比回推權重（避免整排 0）
-    if has_shares and not has_weight and df["股數"].sum() > 0:
+    # 權重缺→以股數占比回推
+    if (df["持股權重"].sum() == 0) and (df["股數"].sum() > 0):
         total = df["股數"].sum()
         df["持股權重"] = (df["股數"] / total * 100).round(6)
 
@@ -146,7 +158,7 @@ def _html_to_df(html: str) -> pd.DataFrame:
         if not _looks_like_holdings(raw):
             continue
         df = _normalize(raw)
-        if df.empty: 
+        if df.empty:
             continue
         if (df["持股權重"].sum() == 0) and (df["股數"].sum() == 0):
             continue
@@ -229,7 +241,7 @@ def _fallback_download_with_cookies(ctx) -> bytes | None:
 
 # ------------------ 主程式 ------------------
 def fetch_snapshot():
-    # 預設用 workflow 給的 REPORT_DATE；稍後若頁面有「資料日期」再覆蓋
+    # 預設用 workflow 的 REPORT_DATE；稍後若頁面有「資料日期」再覆蓋
     effective_date = _date_str_default()
     out_xlsx = _out_path(effective_date)
 
@@ -265,6 +277,12 @@ def fetch_snapshot():
         raise SystemExit("官方頁仍無法取得有效資料（下載/API/DOM 皆失敗）。")
 
     rows = _save_xlsx(df, out_xlsx)
+
+    # ★ 將最後採用的日期寫出，給 workflow 覆寫 REPORT_DATE
+    Path("manifest").mkdir(exist_ok=True, parents=True)
+    (Path("manifest") / "effective_date.txt").write_text(effective_date, encoding="utf-8")
+    print(f"[fetch] EFFECTIVE_DATE={effective_date}")
+
     print(f"[fetch] saved {out_xlsx} rows={rows} (report_date={effective_date})")
 
 if __name__ == "__main__":
