@@ -1,8 +1,9 @@
-# send_email.py — 不含任何圖片的純報表郵件
+# send_email.py — 純報表郵件（無圖片）
 # - 嚴格以 REPORT_DATE（或 manifest/effective_date.txt）為準
 # - 讀取 reports/change_table_{REPORT_DATE}.csv
 # - 表格依「權重Δ%」由大到小排序
 # - 固定列出「首次新增持股」與「關鍵賣出」，若無則顯示「無」
+# - 新增欄位：買賣超股數 = 今日股數 - 昨日股數（若檔案內已帶此欄仍會覆蓋為此計算）
 # - 主送 SMTP（Gmail），失敗則自動改用 SendGrid API
 
 import os
@@ -42,16 +43,18 @@ def find_prev_snapshot(report_date: str) -> str:
     return prev
 
 
-def human(x, digits=2):
-    if pd.isna(x):
-        return ""
+def human_int(x) -> str:
     try:
-        f = float(x)
-        if abs(f - int(f)) < 1e-9:
-            return f"{int(f):,}"
-        return f"{f:.{digits}f}"
+        return f"{int(float(x)):,}"
     except Exception:
-        return str(x)
+        return "0"
+
+
+def human_float(x, digits=2) -> str:
+    try:
+        return f"{float(x):.{digits}f}"
+    except Exception:
+        return "0.00"
 
 
 # -------------------- 郵件內容 --------------------
@@ -63,7 +66,7 @@ def build_html(report_date: str) -> str:
     df = pd.read_csv(change_csv, encoding="utf-8-sig")
 
     # 數字欄位保險轉型
-    for c, as_int in [("今日股數", True), ("昨日股數", True)]:
+    for c in ["今日股數", "昨日股數"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
         else:
@@ -74,6 +77,9 @@ def build_html(report_date: str) -> str:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
         else:
             df[c] = 0.0
+
+    # ✅ 買賣超股數：今日股數 - 昨日股數（即使原檔有，也以這個公式重算一次）
+    df["買賣超股數"] = (df["今日股數"] - df["昨日股數"]).astype(int)
 
     # 依「權重Δ%」由大到小排序
     df_sorted = df.sort_values("權重Δ%", ascending=False).reset_index(drop=True)
@@ -130,24 +136,28 @@ def build_html(report_date: str) -> str:
     </style>
     """
 
-    # 表格列
+    # 表格列（新增「買賣超股數」欄位，並以正負色彩標示）
     rows = []
     for _, r in df_sorted.iterrows():
         code = str(r.get("股票代號", ""))
         name = str(r.get("股票名稱", ""))
         close = ""  # 目前不在此腳本填收盤價
-        s_t = human(r["今日股數"])
-        s_y = human(r["昨日股數"])
-        w_t = f"{float(r['今日權重%']):.2f}%"
-        w_y = f"{float(r['昨日權重%']):.2f}%"
+        s_t = human_int(r["今日股數"])
+        s_y = human_int(r["昨日股數"])
+        w_t = f"{human_float(r['今日權重%']):s}%"
+        w_y = f"{human_float(r['昨日權重%']):s}%"
+        delta_shares = int(r["買賣超股數"])
+        delta_shares_s = f"{delta_shares:+,}"
         dlt = float(r["權重Δ%"])
         dlt_s = f"{dlt:+.2f}%"
-        cls = "pos" if dlt > 0 else "neg" if dlt < 0 else ""
+        cls_sh = "pos" if delta_shares > 0 else "neg" if delta_shares < 0 else ""
+        cls_w  = "pos" if dlt > 0 else "neg" if dlt < 0 else ""
         rows.append(
             f"<tr><td>{code}</td><td>{name}</td><td>{close}</td>"
             f"<td>{s_t}</td><td>{w_t}</td>"
             f"<td>{s_y}</td><td>{w_y}</td>"
-            f"<td class='{cls}'>{dlt_s}</td></tr>"
+            f"<td class='{cls_sh}'>{delta_shares_s}</td>"
+            f"<td class='{cls_w}'>{dlt_s}</td></tr>"
         )
 
     html = f"""
@@ -170,7 +180,7 @@ def build_html(report_date: str) -> str:
             <th>股票代號</th><th>股票名稱</th><th>收盤價</th>
             <th>{col_today_sh}</th><th>{col_today_w}</th>
             <th>{col_yestd_sh}</th><th>{col_yestd_w}</th>
-            <th>權重 Δ%</th>
+            <th>買賣超股數</th><th>權重 Δ%</th>
           </tr>
         </thead>
         <tbody>
