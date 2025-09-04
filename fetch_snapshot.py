@@ -1,14 +1,13 @@
-# fetch_snapshot.py — 官方 API 直接下載 XLSX
-# 來源：統一投信 00981A 官方 API (ezmoney)
+# fetch_snapshot.py — 官方 API 直接下載，兼容 CSV / XLSX
 import os, re, requests
 from pathlib import Path
 from datetime import datetime
 import pandas as pd
+import io
 
 ARCHIVE = Path("archive")
 ARCHIVE.mkdir(exist_ok=True)
-# 官方 XLSX 下載 API
-OFFICIAL_XLSX_API = "https://www.ezmoney.com.tw/ETF/Fund/DownloadHoldingFile?fundCode=49YTW"
+OFFICIAL_API = "https://www.ezmoney.com.tw/ETF/Fund/DownloadHoldingFile?fundCode=49YTW"
 
 def today_str() -> str:
     raw = (os.getenv("REPORT_DATE") or "").strip()
@@ -25,14 +24,25 @@ def fetch_snapshot():
     outdir.mkdir(parents=True, exist_ok=True)
     out_xlsx = outdir / f"ETF_Investment_Portfolio_{yyyymmdd}.xlsx"
 
-    # 直接下載 XLSX
-    resp = requests.get(OFFICIAL_XLSX_API, timeout=60)
+    # 下載檔案
+    resp = requests.get(OFFICIAL_API, timeout=60)
     resp.raise_for_status()
-    with open(out_xlsx, "wb") as f:
-        f.write(resp.content)
+    content_type = resp.headers.get("Content-Type","").lower()
 
-    # 加上 holdings / with_prices 工作表
-    df = pd.read_excel(out_xlsx, sheet_name=0, dtype={"股票代號": str})
+    # 嘗試解析
+    df = None
+    if "csv" in content_type or resp.content.startswith(b"\xef\xbb\xbf") or resp.content[:1] in [b'c', b'C']:
+        # CSV 檔
+        df = pd.read_csv(io.BytesIO(resp.content), dtype={"股票代號": str})
+    else:
+        # 預設嘗試 Excel
+        try:
+            df = pd.read_excel(io.BytesIO(resp.content), engine="openpyxl", dtype={"股票代號": str})
+        except Exception:
+            # 如果失敗，再 fallback CSV
+            df = pd.read_csv(io.BytesIO(resp.content), dtype={"股票代號": str})
+
+    # 欄位標準化
     rename = {}
     for c in df.columns:
         s = str(c)
@@ -49,6 +59,7 @@ def fetch_snapshot():
     if "持股權重" in df.columns:
         df["持股權重"] = pd.to_numeric(df["持股權重"], errors="coerce").fillna(0.0)
 
+    # 存成 XLSX，包含 holdings / with_prices 兩張 sheet
     with pd.ExcelWriter(out_xlsx, engine="openpyxl") as w:
         df.to_excel(w, sheet_name="holdings", index=False)
         df2 = df.copy(); df2["收盤價"] = pd.NA
