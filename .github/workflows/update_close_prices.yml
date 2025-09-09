@@ -2,10 +2,10 @@ name: Update Close Prices (TWSE/TPEx, after data push)
 
 on:
   push:
-    branches: [ main ]   # 若你的預設分支不同，請改這裡
+    branches: [ main ]           # 若你的預設分支不同，請改這裡
     paths:
-      - "data/**/*.csv"  # 只要 data/ 底下有 CSV 變動就觸發
-  workflow_dispatch: {}   # 也可手動跑
+      - "data/**/*.csv"          # 只要 data/ 底下有 CSV 變動就觸發
+  workflow_dispatch: {}          # 可手動執行
 
 concurrency:
   group: update-close-${{ github.ref }}
@@ -49,14 +49,16 @@ jobs:
 
           if [ ${#changed[@]} -eq 0 ]; then
             echo "no_changed=true" >> $GITHUB_OUTPUT
+            echo "No changed CSV under data/"
             exit 0
           fi
 
           printf '%s\n' "${changed[@]}" > /tmp/changed_csv.txt
           echo "changed_count=${#changed[@]}" >> $GITHUB_OUTPUT
-          echo "changed_list<<EOF" >> $GITHUB_OUTPUT
-          printf '%s\n' "${changed[@]}" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+
+          # 👉 A 的 echo：把檔案清單印到 log，方便你在 Actions 看到
+          echo "Changed files:"
+          cat /tmp/changed_csv.txt
 
       - name: Add close prices to changed CSVs
         if: steps.files.outputs.no_changed != 'true'
