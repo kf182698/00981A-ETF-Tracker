@@ -1,0 +1,79 @@
+name: Update Close Prices (TWSE/TPEx, after data push)
+
+on:
+  push:
+    branches: [ main ]   # 若你的預設分支不同，請改這裡
+    paths:
+      - "data/**/*.csv"  # 只要 data/ 底下有 CSV 變動就觸發
+  workflow_dispatch: {}   # 也可手動跑
+
+concurrency:
+  group: update-close-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TZ: Asia/Taipei
+
+jobs:
+  update-close:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install deps
+        run: |
+          python -m pip install -U pip
+          pip install -r requirements.txt
+
+      - name: Resolve changed CSV list
+        id: files
+        shell: bash
+        run: |
+          # 取得本次 push 變動的 data/ CSV 清單（新增或修改）
+          BASE_SHA="${{ github.event.before }}"
+          HEAD_SHA="${{ github.sha }}"
+          if [ -z "$BASE_SHA" ] || [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            # fork/第一個 commit 等情況：全庫掃描 data/**/*.csv
+            mapfile -t changed < <(git ls-files 'data/**/*.csv')
+          else
+            mapfile -t changed < <(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- 'data/**/*.csv')
+          fi
+
+          if [ ${#changed[@]} -eq 0 ]; then
+            echo "no_changed=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          printf '%s\n' "${changed[@]}" > /tmp/changed_csv.txt
+          echo "changed_count=${#changed[@]}" >> $GITHUB_OUTPUT
+          echo "changed_list<<EOF" >> $GITHUB_OUTPUT
+          printf '%s\n' "${changed[@]}" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Add close prices to changed CSVs
+        if: steps.files.outputs.no_changed != 'true'
+        run: |
+          python scripts/add_close_prices_tw.py \
+            --csv-list-file /tmp/changed_csv.txt \
+            --max-backdays 15 \
+            --overwrite-same-day
+
+      - name: Commit & Push if changed
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -A
+            git commit -m "chore(data): add 收盤價 to changed CSVs (TWSE/TPEx)"
+            git push
+          else
+            echo "No changes to commit."
+          fi
