@@ -1,0 +1,105 @@
+# ============================================================================
+# Optimized Update Close Prices Workflow
+# ============================================================================
+# 目的：統一自動追蹤 data/ 與 prices/ 兩個目錄下所有 .csv 檔案，
+#       全部交給 scripts/add_close_prices_tw.py 統一處理並寫入收盤價。
+#
+# 資料夾用途說明：
+#   - data/     : 存放 ETF 投資組合原始數據與處理後的 CSV 檔案
+#   - prices/   : 存放股票價格相關的 CSV 檔案
+#   - scripts/  : 存放自動化腳本，包含 add_close_prices_tw.py（補價腳本）
+#
+# 自動化邏輯：
+#   1. 每天台北時間 20:00 自動執行（或手動觸發）
+#   2. 掃描 data/ 與 prices/ 目錄下所有 .csv 檔案
+#   3. 使用 add_close_prices_tw.py 統一補上台股收盤價
+#   4. 自動提交變更到 Git repository
+#
+# 優點：
+#   - 單一主線自動化流程，避免分岔與命名混亂
+#   - 統一腳本處理，減少維護成本
+#   - 明確資料夾職責，提升後續追蹤效率
+#   - 減少數值遺失與資料重複問題
+#
+# 注意事項：
+#   - 此 workflow 取代舊有的 update_close_prices.yml 和 fill_stock_close_price.yml
+#   - 建議停用或刪除其他重複的 workflow 以避免衝突
+# ============================================================================
+
+name: Optimized Update Close Prices
+
+on:
+  schedule:
+    # 每天台北時間 20:00 執行（UTC+8 = 12:00 UTC）
+    - cron: '0 12 * * *'
+  workflow_dispatch:
+    # 允許手動觸發
+
+jobs:
+  update-close-prices:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pandas yfinance requests openpyxl
+    
+    - name: Process all CSV files in data/ directory
+      run: |
+        echo "=== Processing CSV files in data/ directory ==="
+        if [ -d "data" ]; then
+          for csv_file in data/*.csv; do
+            if [ -f "$csv_file" ]; then
+              echo "Processing: $csv_file"
+              python scripts/add_close_prices_tw.py "$csv_file"
+            fi
+          done
+        else
+          echo "Warning: data/ directory not found"
+        fi
+    
+    - name: Process all CSV files in prices/ directory
+      run: |
+        echo "=== Processing CSV files in prices/ directory ==="
+        if [ -d "prices" ]; then
+          for csv_file in prices/*.csv; do
+            if [ -f "$csv_file" ]; then
+              echo "Processing: $csv_file"
+              python scripts/add_close_prices_tw.py "$csv_file"
+            fi
+          done
+        else
+          echo "Warning: prices/ directory not found"
+        fi
+    
+    - name: Commit and push changes
+      run: |
+        git config --local user.email "github-actions[bot]@users.noreply.github.com"
+        git config --local user.name "GitHub Actions Bot"
+        
+        # 檢查是否有變更
+        if git diff --quiet && git diff --cached --quiet; then
+          echo "No changes to commit"
+        else
+          git add data/*.csv prices/*.csv || true
+          git commit -m "Auto-update: Add close prices to CSV files [$(date +'%Y-%m-%d %H:%M:%S')]"
+          git push
+          echo "Changes committed and pushed successfully"
+        fi
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+# ============================================================================
+# End of Optimized Update Close Prices Workflow
+# ============================================================================
