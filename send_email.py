@@ -56,7 +56,6 @@ def build_html(report_date: str) -> str:
     change_csv = Path("reports") / f"change_table_{report_date}.csv"
     if not change_csv.exists():
         raise SystemExit(f"缺少 {change_csv}，請先執行 build_change_table.py")
-
     df = pd.read_csv(change_csv, encoding="utf-8-sig")
 
     # 嘗試讀取當日收盤價檔，方便郵件內容顯示最新收盤價。若檔案不存在或格式不符則略過。
@@ -127,7 +126,7 @@ def build_html(report_date: str) -> str:
 
     # 首次新增持股 / 大量減持近出清 / 剃除持股清單
     first_buys = df_sorted.loc[(df_sorted["昨日股數"] == 0) & (df_sorted["今日股數"] > 0)]
-    heavy_trim = df_sorted.loc[(df_sorted["昨日股數"] >= 3000) & (df_sorted["今日股數"] <= 2000)]
+    heavy_trim = df_sorted.loc[(df_sorted["昨日股數"] >= 2001) & (df_sorted["今日股數"] <= 2000)]
     trimmed_positions = df_sorted.loc[(df_sorted["昨日股數"] > 0) & (df_sorted["今日股數"] == 0)]
 
     def list_codes_names(sub: pd.DataFrame) -> str:
@@ -161,7 +160,7 @@ def build_html(report_date: str) -> str:
       .pos { color: #16a34a; font-weight: 600; }
       .neg { color: #dc2626; font-weight: 600; }
       .note { color:#6b7280; font-size:12px; margin-top:12px;}
-    
+
     """
 
     # 表格列（新增「買賣超股數」欄位，並以正負色彩標示）
@@ -197,43 +196,41 @@ def build_html(report_date: str) -> str:
         cls_w  = "pos" if dlt > 0 else "neg" if dlt < 0 else ""
         rows.append(
             f"<tr>"
-            f"<td>{code}</td><td>{name}</td><td>{close}</td>"
-            f"<td>{s_t}</td><td>{w_t}</td>"
-            f"<td>{s_y}</td><td>{w_y}</td>"
-            f"<td class='{cls_sh}'>{delta_shares_s}</td>"
-            f"<td class='{cls_w}'>{dlt_s}</td></tr>"
+            f"{code}{name}{close}"
+            f"{s_t}{w_t}"
+            f"{s_y}{w_y}"
+            f"<td class=\"{cls_sh}\">{delta_shares_s}</td>"
+            f"<td class=\"{cls_w}\">{dlt_s}</td></tr>"
         )
 
     html = f"""
-      <div class="title">00981A 今日追蹤摘要（{report_date}）</div>
-      <div class="meta">
-        ▶ 前十大權重合計：{top10_sum:.2f}%　▶ 最大權重：{max_text}　▶ 比較基期（昨）：{prev_date}
+      <div class=\"title\">00981A 今日追蹤摘要（{report_date}）</div>
+      <div class=\"meta\">\n        ▶ 前十大權重合計：{top10_sum:.2f}%　▶ 最大權重：{max_text}　▶ 比較基期（昨）：{prev_date}
       </div>
-      <div class="sec">📌 首次新增持股</div>
+      <div class=\"sec\">📌 首次新增持股</div>
       {first_buys_str}
-      <div class="sec">📌 大量減持近出清</div>
+      <div class=\"sec\">📌 大量減持近出清</div>
       {heavy_trim_str}
-      <div class="sec">📌 剃除持股</div>
+      <div class=\"sec\">📌 剃除持股</div>
       {trimmed_positions_str}
-      <div class="sec">📊 每日持股變化追蹤表（依「權重Δ%」由大到小）</div>
+      <div class=\"sec\">📊 每日持股變化追蹤表（依「權重Δ%」由大到小）</div>
       <table>
         <thead>
           <tr>
-            <th>股票代號</th><th>股票名稱</th><th>收盤價</th>
-            <th>{col_today_sh}</th><th>{col_today_w}</th>
-            <th>{col_yestd_sh}</th><th>{col_yestd_w}</th>
-            <th>買賣超股數</th><th>權重 Δ%</th>
+            股票代號股票名稱收盤價
+            {col_today_sh}{col_today_w}
+            {col_yestd_sh}{col_yestd_w}
+            買賣超股數權重 Δ%
           </tr>
         </thead>
         <tbody>
           {''.join(rows)}
         </tbody>
       </table>
-      <div class="note">
-        本信件為自動產生，字型統一使用微軟正黑體。若您誤收此信或不需再接收，煩請直接回覆告知；
+      <div class=\"note\">\n        本信件為自動產生，字型統一使用微軟正黑體。若您誤收此信或不需再接收，煩請直接回覆告知；
         本郵件僅供研究追蹤用途，非投資建議，謝謝。
       </div>
-    
+
     """
     return html
 
@@ -255,6 +252,7 @@ def send_with_smtp(html: str):
     with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx) as server:
         server.login(user, pwd)
         server.sendmail(user, [to], msg.as_string())
+
 
 def send_with_sendgrid(html: str):
     key = os.getenv("SENDGRID_API_KEY")
@@ -292,6 +290,7 @@ def main():
         print(f"[mail] SMTP failed → fallback: {e}")
         send_with_sendgrid(html)
         print("[mail] SendGrid sent")
+
 
 if __name__ == "__main__":
     main()
