@@ -49,12 +49,16 @@ def human_float(x, digits=2) -> str:
         return f"{float(x):.{digits}f}"
     except Exception:
         return "0.00"
+
 # -------------------- 郵件內容 --------------------
+
 def build_html(report_date: str) -> str:
     change_csv = Path("reports") / f"change_table_{report_date}.csv"
     if not change_csv.exists():
         raise SystemExit(f"缺少 {change_csv}，請先執行 build_change_table.py")
+
     df = pd.read_csv(change_csv, encoding="utf-8-sig")
+
     # 嘗試讀取當日收盤價檔，方便郵件內容顯示最新收盤價。若檔案不存在或格式不符則略過。
     price_map = {}
     price_csv = Path("prices") / f"{report_date}.csv"
@@ -88,6 +92,7 @@ def build_html(report_date: str) -> str:
                         pass
         except Exception:
             price_map = {}
+
     # 數字欄位保險轉型
     for c in ["今日股數", "昨日股數"]:
         if c in df.columns:
@@ -99,12 +104,16 @@ def build_html(report_date: str) -> str:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
         else:
             df[c] = 0.0
+
     # ✅ 買賣超股數：今日股數 - 昨日股數（即使原檔有，也以這個公式重算一次）
     df["買賣超股數"] = (df["今日股數"] - df["昨日股數"]).astype(int)
+
     # 依「權重Δ%」由大到小排序
     df_sorted = df.sort_values("權重Δ%", ascending=False).reset_index(drop=True)
+
     # 找基期日期
     prev_date = find_prev_snapshot(report_date) or "N/A"
+
     # 摘要資料（前十大權重、最大權重）
     top10_sum = df_sorted["今日權重%"].nlargest(10).sum()
     max_row = df_sorted.nlargest(1, "今日權重%")
@@ -115,9 +124,11 @@ def build_html(report_date: str) -> str:
         max_text = f"{max_code} {max_name}（{max_weight:.2f}%）"
     else:
         max_text = "—"
-    # 首次新增持股 / 剃除持股清單
+
+    # 首次新增持股 / 大量減持近出清 / 剃除持股清單
     first_buys = df_sorted.loc[(df_sorted["昨日股數"] == 0) & (df_sorted["今日股數"] > 0)]
-    trimmed_positions  = df_sorted.loc[(df_sorted["昨日股數"] > 0) & (df_sorted["今日股數"] == 0)]
+    heavy_trim = df_sorted.loc[(df_sorted["昨日股數"] >= 3000) & (df_sorted["今日股數"] <= 2000)]
+    trimmed_positions = df_sorted.loc[(df_sorted["昨日股數"] > 0) & (df_sorted["今日股數"] == 0)]
 
     def list_codes_names(sub: pd.DataFrame) -> str:
         if sub.empty:
@@ -127,12 +138,15 @@ def build_html(report_date: str) -> str:
         return "、".join(items)
 
     first_buys_str = list_codes_names(first_buys)
-    trimmed_positions_str  = list_codes_names(trimmed_positions)
+    heavy_trim_str = list_codes_names(heavy_trim)
+    trimmed_positions_str = list_codes_names(trimmed_positions)
+
     # 欄名顯示（帶日期）
     col_today_w  = f"今日權重%（{report_date}）"
     col_yestd_w  = f"昨日權重%（{prev_date}）"
     col_today_sh = f"股數（{report_date}）"
     col_yestd_sh = f"股數（{prev_date}）"
+
     # HTML 樣式（微軟正黑體）
     style = """
       body { font-family: 'Microsoft JhengHei','PingFang TC','Noto Sans CJK TC',Arial,sans-serif; }
@@ -149,6 +163,7 @@ def build_html(report_date: str) -> str:
       .note { color:#6b7280; font-size:12px; margin-top:12px;}
     
     """
+
     # 表格列（新增「買賣超股數」欄位，並以正負色彩標示）
     rows = []
     for _, r in df_sorted.iterrows():
@@ -181,12 +196,14 @@ def build_html(report_date: str) -> str:
         cls_sh = "pos" if delta_shares > 0 else "neg" if delta_shares < 0 else ""
         cls_w  = "pos" if dlt > 0 else "neg" if dlt < 0 else ""
         rows.append(
-            f"<tr><td>{code}</td><td>{name}</td><td>{close}</td>"
+            f"<tr>"
+            f"<td>{code}</td><td>{name}</td><td>{close}</td>"
             f"<td>{s_t}</td><td>{w_t}</td>"
             f"<td>{s_y}</td><td>{w_y}</td>"
-            f"<td class=\"{cls_sh}\">{delta_shares_s}</td>"
-            f"<td class=\"{cls_w}\">{dlt_s}</td></tr>"
+            f"<td class='{cls_sh}'>{delta_shares_s}</td>"
+            f"<td class='{cls_w}'>{dlt_s}</td></tr>"
         )
+
     html = f"""
       <div class="title">00981A 今日追蹤摘要（{report_date}）</div>
       <div class="meta">
@@ -194,6 +211,8 @@ def build_html(report_date: str) -> str:
       </div>
       <div class="sec">📌 首次新增持股</div>
       {first_buys_str}
+      <div class="sec">📌 大量減持近出清</div>
+      {heavy_trim_str}
       <div class="sec">📌 剃除持股</div>
       {trimmed_positions_str}
       <div class="sec">📊 每日持股變化追蹤表（依「權重Δ%」由大到小）</div>
@@ -217,6 +236,7 @@ def build_html(report_date: str) -> str:
     
     """
     return html
+
 # -------------------- 寄信（SMTP/SendGrid） --------------------
 
 def send_with_smtp(html: str):
@@ -257,6 +277,7 @@ def send_with_sendgrid(html: str):
     )
     if r.status_code >= 300:
         raise RuntimeError(f"SendGrid error: {r.status_code} {r.text[:200]}")
+
 
 def main():
     report_date = get_report_date()
