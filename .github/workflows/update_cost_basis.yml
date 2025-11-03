@@ -1,0 +1,74 @@
+name: Update Cost Basis
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "reports/change_table*.csv"  # 只要 reports/ 下 change_table 檔案有變動就觸發
+  workflow_dispatch: {}              # 允許手動觸發
+
+env:
+  TZ: Asia/Taipei
+
+jobs:
+  update-cost-basis:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -U pip
+          pip install -r requirements.txt
+
+      - name: Resolve changed change_table CSV list
+        id: changed
+        shell: bash
+        run: |
+          # 找出這次 commit 變動的 change_table 檔案（新增或修改）
+          BASE_SHA="${{ github.event.before }}"
+          HEAD_SHA="${{ github.sha }}"
+          if [ -z "$BASE_SHA" ] || [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            mapfile -t changed_files < <(git ls-files 'reports/change_table*.csv')
+          else
+            mapfile -t changed_files < <(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- 'reports/change_table*.csv')
+          fi
+          if [ ${#changed_files[@]} -eq 0 ]; then
+            echo "no_changed=true" >> $GITHUB_OUTPUT
+            echo "No change_table CSVs changed."
+            exit 0
+          fi
+          printf '%s\n' "${changed_files[@]}" > /tmp/changed_table.txt
+          echo "changed_count=${#changed_files[@]}" >> $GITHUB_OUTPUT
+          echo "Changed files:"
+          cat /tmp/changed_table.txt
+
+      - name: Update cost basis
+        if: steps.changed.outputs.no_changed != 'true'
+        run: |
+          # 對於每一個變動的 change_table CSV 都更新成本市值
+          while IFS= read -r table_path; do
+            python scripts/update_cost_basis.py \
+              --change-table-path "$table_path" \
+              --cost-basis-path data/cost_basis.csv \
+              --output-path data/cost_basis.csv
+          done < /tmp/changed_table.txt
+
+      - name: Commit & Push if changed
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -A
+            git commit -m "chore(cost): update cost basis from change_table"
+            git push
+          else
+            echo "No changes to commit."
