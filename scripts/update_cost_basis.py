@@ -43,9 +43,18 @@ file with the updated one.
 """
 
 import argparse
+import re
 from pathlib import Path
 
 import pandas as pd
+
+
+def _log_realized_gains(record: dict, log_path: Path) -> None:
+    df = pd.DataFrame([record])
+    header = not log_path.exists()
+    # 確保資料夾存在
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(log_path, mode="a", index=False, header=header, encoding="utf-8-sig")
 
 
 def load_cost_basis(path: Path) -> pd.DataFrame:
@@ -74,13 +83,15 @@ def load_cost_basis(path: Path) -> pd.DataFrame:
     return pd.DataFrame(columns=["股票代號", "股票名稱", "股數", "成本市值"])
 
 
-def update_cost_basis(cost_df: pd.DataFrame, change_df: pd.DataFrame) -> pd.DataFrame:
+def update_cost_basis(cost_df: pd.DataFrame, change_df: pd.DataFrame, report_date: str, gains_log_path: Path) -> pd.DataFrame:
     """Update cost basis DataFrame using daily change information.
 
     Args:
         cost_df: Existing cost basis DataFrame.
         change_df: DataFrame of the daily change table.  Must contain
             ``股票代號``, ``股票名稱``, ``今日股數``, ``買賣超股數``, ``首次買進``, ``今日收盤價``.
+        report_date: Date string of the change table.
+        gains_log_path: Path to the realized gains log file.
 
     Returns:
         Updated DataFrame with new cost basis and share counts.
@@ -134,11 +145,41 @@ def update_cost_basis(cost_df: pd.DataFrame, change_df: pd.DataFrame) -> pd.Data
             updated_shares = existing_shares + new_shares
             cost_df.loc[code, "成本市值"] = updated_value
             cost_df.loc[code, "股數"] = updated_shares
-        # If shares sold, subtract share count but leave cost basis unchanged
+        # If shares sold, apply moving average cost and log if fully cleared
         elif new_shares < 0:
             existing_shares = int(cost_df.loc[code, "股數"])
-            updated_shares = max(0, existing_shares + new_shares)
+            existing_value = float(cost_df.loc[code, "成本市值"])
+            
+            sell_shares = abs(new_shares)
+            actual_sell_shares = min(sell_shares, existing_shares)
+            
+            avg_unit_cost = (existing_value / existing_shares) if existing_shares > 0 else 0.0
+            updated_shares = existing_shares - actual_sell_shares
+            
+            deducted_cost = actual_sell_shares * avg_unit_cost
+            updated_value = max(0.0, existing_value - deducted_cost)
+            
             cost_df.loc[code, "股數"] = updated_shares
+            cost_df.loc[code, "成本市值"] = updated_value
+            
+            # Log realized gains if fully cleared
+            if updated_shares == 0 and actual_sell_shares > 0:
+                realized_profit = actual_sell_shares * (price - avg_unit_cost)
+                total_original_cost = actual_sell_shares * avg_unit_cost
+                roi = (realized_profit / total_original_cost) if total_original_cost > 0 else 0.0
+                
+                record = {
+                    "日期": report_date,
+                    "股票代號": code,
+                    "股票名稱": name,
+                    "賣出股數": actual_sell_shares,
+                    "平均單位成本": round(avg_unit_cost, 4),
+                    "賣出價格": price,
+                    "總投資成本": round(total_original_cost, 2),
+                    "實現損益": round(realized_profit, 2),
+                    "報酬率": round(roi, 4)
+                }
+                _log_realized_gains(record, gains_log_path)
     return cost_df.reset_index(drop=True)
 
 
@@ -162,7 +203,17 @@ def main() -> None:
         default=Path("cost_basis_updated.csv"),
         help="Path to save the updated cost basis CSV",
     )
+    parser.add_argument(
+        "--gains-log-path",
+        type=Path,
+        default=Path("data/realized_gains_log.csv"),
+        help="Path to save the realized gains log CSV",
+    )
     args = parser.parse_args()
+
+    # Extract date from change_table_path
+    match = re.search(r"\d{4}-\d{2}-\d{2}", args.change_table_path.name)
+    report_date = match.group(0) if match else pd.Timestamp.today().strftime("%Y-%m-%d")
 
     # Read daily change table
     change_df = pd.read_csv(args.change_table_path, encoding="utf-8-sig", dtype=str)
@@ -175,7 +226,7 @@ def main() -> None:
     # Load existing cost basis
     cost_df = load_cost_basis(args.cost_basis_path)
     # Update cost basis
-    updated_df = update_cost_basis(cost_df, change_df)
+    updated_df = update_cost_basis(cost_df, change_df, report_date, args.gains_log_path)
     # Save output
     updated_df.to_csv(args.output_path, index=False, encoding="utf-8-sig")
     print(f"Updated cost basis written to {args.output_path}")
