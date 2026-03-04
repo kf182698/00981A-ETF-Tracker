@@ -44,7 +44,7 @@ def auto_fill_csv(date_csv):
 if __name__ == "__main__":
     # 自動選取 data 資料夾最新檔
     data_folder = 'data'
-    files = sorted([f for f in os.listdir(data_folder) if f.endswith('.csv')])
+    files = sorted([f for f in os.listdir(data_folder) if f.endswith('.csv') and not f.endswith('_with_price.csv')])
     if not files:
         print("No csv found.")
     else:
