@@ -212,7 +212,8 @@ def main() -> None:
     args = parser.parse_args()
 
     # Extract date from change_table_path
-    match = re.search(r"\d{4}-\d{2}-\d{2}", args.change_table_path.name)
+    change_path_str = str(args.change_table_path.name) if isinstance(args.change_table_path, Path) else str(args.change_table_path)
+    match = re.search(r"\d{4}-\d{2}-\d{2}", change_path_str)
     report_date = match.group(0) if match else pd.Timestamp.today().strftime("%Y-%m-%d")
 
     # Read daily change table
