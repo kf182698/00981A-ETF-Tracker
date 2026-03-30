@@ -98,7 +98,7 @@ jobs:
           echo "Changes committed and pushed successfully"
         fi
       env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GITHUB_TOKEN: ${{ secrets.GH_PAT }}
 
 # ============================================================================
 # End of Optimized Update Close Prices Workflow
