@@ -1,0 +1,17 @@
+# Secrets and Credentials
+.env
+*.env
+.streamlit/secrets.toml
+
+# Python Environment and Cache
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# Editor Config
+.vscode/
+
+# Logs
+*.log
