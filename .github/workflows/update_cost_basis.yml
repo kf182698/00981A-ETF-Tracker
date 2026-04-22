@@ -1,11 +1,18 @@
 name: Update Cost Basis
 
 on:
+  schedule:
+    # UTC 12:20 = Asia/Taipei 20:20, after reports/change_table generation.
+    - cron: "20 12 * * 1-5"
   push:
     branches: [ main ]
     paths:
-      - "reports/change_table*.csv"  # 只要 reports/ 下 change_table 檔案有變動就觸發
-  workflow_dispatch: {}              # 允許手動觸發
+      - "reports/change_table*.csv"
+  workflow_dispatch: {}
+
+concurrency:
+  group: update-cost-basis-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   TZ: Asia/Taipei
@@ -29,32 +36,43 @@ jobs:
           python -m pip install -U pip
           pip install -r requirements.txt
 
-      - name: Resolve changed change_table CSV list
+      - name: Resolve target change_table CSV list
         id: changed
         shell: bash
         run: |
-          # 找出這次 commit 變動的 change_table 檔案（新增或修改）
-          BASE_SHA="${{ github.event.before }}"
-          HEAD_SHA="${{ github.sha }}"
-          if [ -z "$BASE_SHA" ] || [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
-            mapfile -t changed_files < <(git ls-files 'reports/change_table*.csv')
+          changed_files=()
+
+          if [ "${{ github.event_name }}" = "push" ]; then
+            # For push events, only process the change_table files touched by this push.
+            BASE_SHA="${{ github.event.before }}"
+            HEAD_SHA="${{ github.sha }}"
+            if [ -z "$BASE_SHA" ] || [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+              mapfile -t changed_files < <(git ls-files 'reports/change_table*.csv')
+            else
+              mapfile -t changed_files < <(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- 'reports/change_table*.csv')
+            fi
           else
-            mapfile -t changed_files < <(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- 'reports/change_table*.csv')
+            # For schedule/manual runs, reconcile cost basis against the latest change_table.
+            latest_file="$(ls -1 reports/change_table*.csv 2>/dev/null | sort | tail -n 1)"
+            if [ -n "$latest_file" ]; then
+              changed_files=("$latest_file")
+            fi
           fi
+
           if [ ${#changed_files[@]} -eq 0 ]; then
-            echo "no_changed=true" >> $GITHUB_OUTPUT
-            echo "No change_table CSVs changed."
+            echo "no_changed=true" >> "$GITHUB_OUTPUT"
+            echo "No eligible change_table CSVs found."
             exit 0
           fi
+
           printf '%s\n' "${changed_files[@]}" > /tmp/changed_table.txt
-          echo "changed_count=${#changed_files[@]}" >> $GITHUB_OUTPUT
-          echo "Changed files:"
+          echo "changed_count=${#changed_files[@]}" >> "$GITHUB_OUTPUT"
+          echo "Target files:"
           cat /tmp/changed_table.txt
 
       - name: Update cost basis
         if: steps.changed.outputs.no_changed != 'true'
         run: |
-          # 對於每一個變動的 change_table CSV 都更新成本市值
           while IFS= read -r table_path; do
             python scripts/update_cost_basis.py \
               --change-table-path "$table_path" \
@@ -62,13 +80,14 @@ jobs:
               --output-path data/cost_basis.csv
           done < /tmp/changed_table.txt
 
-      - name: Commit & Push if changed
+      - name: Commit & push if changed
         run: |
           if [ -n "$(git status --porcelain)" ]; then
-            git config user.name  "github-actions[bot]"
+            git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add -A
             git commit -m "chore(cost): update cost basis from change_table"
             git push
           else
             echo "No changes to commit."
+          fi
