@@ -70,6 +70,7 @@ jobs:
           OVERWRITE_FLAG=""
           if [ "${{ github.event.inputs.overwrite }}" = "true" ]; then
             OVERWRITE_FLAG="--overwrite"
+            # 同時清除舊的實現損益紀錄，確保完全重建
             rm -f data/realized_gains_log.csv
             echo "[backfill] 全量重建模式：已清除 realized_gains_log.csv"
           fi
