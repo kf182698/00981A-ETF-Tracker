@@ -122,6 +122,20 @@ jobs:
           PY
       - name: Build change table + summary
         run: python build_change_table.py
+      - name: Update cost basis
+        # 直接整合於此，不依賴 push 觸發另一個 workflow（GITHUB_TOKEN 推送不會觸發其他 workflow）
+        run: |
+          CHANGE_TABLE="reports/change_table_${REPORT_DATE}.csv"
+          if [ -f "$CHANGE_TABLE" ]; then
+            python scripts/update_cost_basis.py \
+              --change-table-path "$CHANGE_TABLE" \
+              --cost-basis-path data/cost_basis.csv \
+              --output-path data/cost_basis.csv \
+              --gains-log-path data/realized_gains_log.csv
+            echo "[cost] cost_basis updated for ${REPORT_DATE}"
+          else
+            echo "[cost] change_table not found, skip: $CHANGE_TABLE"
+          fi
       - name: Generate charts
         run: python charts.py
       - name: Commit & push

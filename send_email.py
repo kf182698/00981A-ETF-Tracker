@@ -59,6 +59,91 @@ def human_float(x, digits=2) -> str:
 
 
 # -------------------- 郵件內容 --------------------
+def _build_cost_basis_section(report_date: str, price_map: dict) -> str:
+    """讀取 data/cost_basis.csv，產出成本追蹤 HTML 段落。找不到檔案則回傳空字串。"""
+    cost_path = Path("data/cost_basis.csv")
+    if not cost_path.exists():
+        return ""
+    try:
+        df = pd.read_csv(cost_path, encoding="utf-8-sig")
+        df.columns = [str(c).replace("﻿", "").strip() for c in df.columns]
+        if "股票代號" not in df.columns or "成本市值" not in df.columns:
+            return ""
+        df["股數"] = pd.to_numeric(df.get("股數", 0), errors="coerce").fillna(0).astype(int)
+        df["成本市值"] = pd.to_numeric(df["成本市值"], errors="coerce").fillna(0.0)
+        # 只顯示仍持有的股票（股數 > 0）
+        df = df[df["股數"] > 0].copy()
+        if df.empty:
+            return ""
+    except Exception:
+        return ""
+
+    rows_html = []
+    total_cost = 0.0
+    total_market = 0.0
+
+    for _, r in df.sort_values("成本市值", ascending=False).iterrows():
+        code = str(r.get("股票代號", ""))
+        name = str(r.get("股票名稱", ""))
+        shares = int(r["股數"])
+        cost_val = float(r["成本市值"])
+        avg_cost = cost_val / shares if shares > 0 else 0.0
+
+        price = price_map.get(code)
+        if price is not None and price > 0:
+            market_val = price * shares
+            pnl = market_val - cost_val
+            roi = pnl / cost_val if cost_val > 0 else 0.0
+            market_str = f"{market_val:,.0f}"
+            pnl_str = f"{pnl:+,.0f}"
+            roi_str = f"{roi:+.2%}"
+            pnl_cls = "pos" if pnl >= 0 else "neg"
+            total_market += market_val
+        else:
+            market_str = "—"
+            pnl_str = "—"
+            roi_str = "—"
+            pnl_cls = ""
+
+        total_cost += cost_val
+        rows_html.append(
+            f"<tr><td>{code}</td><td>{name}</td>"
+            f"<td>{shares:,}</td><td>{avg_cost:.2f}</td>"
+            f"<td>{cost_val:,.0f}</td><td>{market_str}</td>"
+            f"<td class='{pnl_cls}'>{pnl_str}</td>"
+            f"<td class='{pnl_cls}'>{roi_str}</td></tr>"
+        )
+
+    total_pnl = total_market - total_cost if total_market > 0 else None
+    total_pnl_str = f"{total_pnl:+,.0f}" if total_pnl is not None else "—"
+    total_roi_str = f"{total_pnl/total_cost:+.2%}" if (total_pnl is not None and total_cost > 0) else "—"
+    total_market_str = f"{total_market:,.0f}" if total_market > 0 else "—"
+    pnl_cls_total = ("pos" if total_pnl >= 0 else "neg") if total_pnl is not None else ""
+
+    return f"""
+      <div class="sec">💰 成本追蹤（{report_date}）</div>
+      <div style="margin-bottom:6px;font-size:13px;">
+        總投資成本：<b>{total_cost:,.0f}</b> 元
+        今日持倉市值：<b>{total_market_str}</b> 元
+        浮動損益：<b class="{pnl_cls_total}">{total_pnl_str}</b> 元
+        報酬率：<b class="{pnl_cls_total}">{total_roi_str}</b>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>股票代號</th><th>股票名稱</th>
+            <th>持有股數</th><th>平均成本(元)</th>
+            <th>成本市值(元)</th><th>今日市值(元)</th>
+            <th>浮動損益(元)</th><th>報酬率</th>
+          </tr>
+        </thead>
+        <tbody>
+          {''.join(rows_html)}
+        </tbody>
+      </table>
+    """
+
+
 def build_html(report_date: str) -> str:
     change_csv = Path("reports") / f"change_table_{report_date}.csv"
     if not change_csv.exists():
@@ -212,6 +297,8 @@ def build_html(report_date: str) -> str:
             f"<td class='{cls_w}'>{dlt_s}</td></tr>"
         )
 
+    cost_basis_html = _build_cost_basis_section(report_date, price_map)
+
     html = f"""
     <html><head>{style}</head><body>
       <div class="title">00981A 今日追蹤摘要（{report_date}）</div>
@@ -227,6 +314,8 @@ def build_html(report_date: str) -> str:
 
       <div class="sec">📌 剃除持股</div>
       <div>{trimmed_positions_str}</div>
+
+      {cost_basis_html}
 
       <div class="sec">📊 每日持股變化追蹤表（依「權重Δ%」由大到小）</div>
       <table>

@@ -99,7 +99,8 @@ def update_cost_basis(cost_df: pd.DataFrame, change_df: pd.DataFrame, report_dat
     # Ensure numeric fields are proper types
     change_df["今日股數"] = pd.to_numeric(change_df["今日股數"], errors="coerce").fillna(0).astype(int)
     change_df["買賣超股數"] = pd.to_numeric(change_df["買賣超股數"], errors="coerce").fillna(0).astype(int)
-    change_df["今日收盤價"] = pd.to_numeric(change_df["今日收盤價"], errors="coerce").fillna(0.0)
+    # 保留 NaN 不填 0，讓後續逐列檢查並跳過，避免以 0 元計入成本
+    change_df["今日收盤價"] = pd.to_numeric(change_df["今日收盤價"], errors="coerce")
 
     # Ensure cost_df numeric columns
     if not cost_df.empty:
@@ -120,12 +121,18 @@ def update_cost_basis(cost_df: pd.DataFrame, change_df: pd.DataFrame, report_dat
         else:
             first_buy = bool(val)
         new_shares = int(row["買賣超股數"])
-        price = float(row["今日收盤價"])
+        price_raw = row["今日收盤價"]
+        price_missing = pd.isna(price_raw) or float(price_raw) <= 0
+        price = 0.0 if price_missing else float(price_raw)
         total_today_shares = int(row["今日股數"])
+
         # Determine if the stock is already in cost_df
         if code not in cost_df.index:
             # First encounter: Only process if first_buy flag or any shares held
             if first_buy or total_today_shares > 0:
+                if price_missing:
+                    print(f"[warn] {code} ({report_date}) 今日收盤價缺失，跳過成本初始化，待有價格時再補建")
+                    continue
                 cost_value = price * total_today_shares
                 cost_df.loc[code] = {
                     "股票代號": code,
@@ -134,52 +141,61 @@ def update_cost_basis(cost_df: pd.DataFrame, change_df: pd.DataFrame, report_dat
                     "成本市值": cost_value,
                 }
             continue
+
         # Stock already exists; update name if necessary
         if name:
             cost_df.loc[code, "股票名稱"] = name
+
         # If new shares purchased (positive), add to cost basis
         if new_shares > 0:
-            existing_value = float(cost_df.loc[code, "成本市值"])
-            existing_shares = int(cost_df.loc[code, "股數"])
-            updated_value = existing_value + new_shares * price
-            updated_shares = existing_shares + new_shares
-            cost_df.loc[code, "成本市值"] = updated_value
-            cost_df.loc[code, "股數"] = updated_shares
+            if price_missing:
+                print(f"[warn] {code} ({report_date}) 今日收盤價缺失，買進 {new_shares} 股的成本無法計入，跳過")
+            else:
+                existing_value = float(cost_df.loc[code, "成本市值"])
+                existing_shares = int(cost_df.loc[code, "股數"])
+                updated_value = existing_value + new_shares * price
+                updated_shares = existing_shares + new_shares
+                cost_df.loc[code, "成本市值"] = updated_value
+                cost_df.loc[code, "股數"] = updated_shares
+
         # If shares sold, apply moving average cost and log if fully cleared
         elif new_shares < 0:
             existing_shares = int(cost_df.loc[code, "股數"])
             existing_value = float(cost_df.loc[code, "成本市值"])
-            
+
             sell_shares = abs(new_shares)
             actual_sell_shares = min(sell_shares, existing_shares)
-            
+
             avg_unit_cost = (existing_value / existing_shares) if existing_shares > 0 else 0.0
             updated_shares = existing_shares - actual_sell_shares
-            
+
             deducted_cost = actual_sell_shares * avg_unit_cost
             updated_value = max(0.0, existing_value - deducted_cost)
-            
+
             cost_df.loc[code, "股數"] = updated_shares
             cost_df.loc[code, "成本市值"] = updated_value
-            
-            # Log realized gains if fully cleared
+
+            # Log realized gains if fully cleared (only when price is available)
             if updated_shares == 0 and actual_sell_shares > 0:
-                realized_profit = actual_sell_shares * (price - avg_unit_cost)
-                total_original_cost = actual_sell_shares * avg_unit_cost
-                roi = (realized_profit / total_original_cost) if total_original_cost > 0 else 0.0
-                
-                record = {
-                    "日期": report_date,
-                    "股票代號": code,
-                    "股票名稱": name,
-                    "賣出股數": actual_sell_shares,
-                    "平均單位成本": round(avg_unit_cost, 4),
-                    "賣出價格": price,
-                    "總投資成本": round(total_original_cost, 2),
-                    "實現損益": round(realized_profit, 2),
-                    "報酬率": round(roi, 4)
-                }
-                _log_realized_gains(record, gains_log_path)
+                if price_missing:
+                    print(f"[warn] {code} ({report_date}) 完全清倉但收盤價缺失，實現損益無法計算，略過記錄")
+                else:
+                    realized_profit = actual_sell_shares * (price - avg_unit_cost)
+                    total_original_cost = actual_sell_shares * avg_unit_cost
+                    roi = (realized_profit / total_original_cost) if total_original_cost > 0 else 0.0
+
+                    record = {
+                        "日期": report_date,
+                        "股票代號": code,
+                        "股票名稱": name,
+                        "賣出股數": actual_sell_shares,
+                        "平均單位成本": round(avg_unit_cost, 4),
+                        "賣出價格": price,
+                        "總投資成本": round(total_original_cost, 2),
+                        "實現損益": round(realized_profit, 2),
+                        "報酬率": round(roi, 4)
+                    }
+                    _log_realized_gains(record, gains_log_path)
     return cost_df.reset_index(drop=True)
 
 
