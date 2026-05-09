@@ -1,0 +1,108 @@
+name: Backfill Cost Basis
+
+on:
+  workflow_dispatch:
+    inputs:
+      overwrite:
+        description: "全量重建（--overwrite）：清除現有帳簿從頭重算，否則為增量續跑"
+        required: false
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+
+concurrency:
+  group: backfill-cost-basis
+  cancel-in-progress: true
+
+env:
+  TZ: Asia/Taipei
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -U pip
+          pip install -r requirements.txt
+
+      - name: Re-run build_change_table for dates missing 今日收盤價
+        run: |
+          python - <<'PY'
+          import subprocess, glob, os
+          from pathlib import Path
+          import pandas as pd
+
+          files = sorted(glob.glob("reports/change_table_*.csv"))
+          missing = []
+          for f in files:
+              cols = pd.read_csv(f, nrows=0, encoding="utf-8-sig").columns.tolist()
+              if "今日收盤價" not in cols:
+                  date = Path(f).stem.replace("change_table_", "")
+                  if Path(f"prices/{date}.csv").exists():
+                      missing.append(date)
+
+          print(f"補跑 {len(missing)} 個缺少收盤價的 change_table ...")
+          for date in missing:
+              r = subprocess.run(
+                  ["python", "build_change_table.py"],
+                  env={**os.environ, "REPORT_DATE": date},
+                  capture_output=True, text=True
+              )
+              status = "✅" if r.returncode == 0 else f"❌ {r.stderr[-80:]}"
+              print(f"  {date}: {status}")
+          PY
+
+      - name: Run backfill_cost_basis.py
+        run: |
+          OVERWRITE_FLAG=""
+          if [ "${{ github.event.inputs.overwrite }}" = "true" ]; then
+            OVERWRITE_FLAG="--overwrite"
+            rm -f data/realized_gains_log.csv
+            echo "[backfill] 全量重建模式：已清除 realized_gains_log.csv"
+          fi
+          python scripts/backfill_cost_basis.py \
+            --reports-dir reports \
+            --output data/cost_basis.csv \
+            --gains-log data/realized_gains_log.csv \
+            $OVERWRITE_FLAG
+
+      - name: Verify output
+        run: |
+          python - <<'PY'
+          import pandas as pd
+          df = pd.read_csv("data/cost_basis.csv", encoding="utf-8-sig")
+          df["股數"] = pd.to_numeric(df.get("股數", 0), errors="coerce").fillna(0).astype(int)
+          df["成本市值"] = pd.to_numeric(df.get("成本市值", 0), errors="coerce").fillna(0.0)
+          active = df[df["股數"] > 0]
+          print(f"[verify] 持有中：{len(active)} 檔，總投資成本：{active['成本市值'].sum()/1e8:.2f} 億元")
+          bad = active[active["成本市值"] <= 0]
+          if not bad.empty:
+              print(f"[verify] ⚠️  成本異常：{bad[['股票代號','股票名稱']].to_string(index=False)}")
+          else:
+              print("[verify] ✅ 成本資料無異常")
+          PY
+
+      - name: Commit & push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/cost_basis.csv data/realized_gains_log.csv reports/change_table_*.csv || true
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "chore(cost): backfill cost basis (overwrite=${{ github.event.inputs.overwrite }})"
+            git push origin HEAD:main
+          fi
