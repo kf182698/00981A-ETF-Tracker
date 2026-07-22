@@ -120,6 +120,8 @@ jobs:
           else:
               print("[snapshot] no change; skip")
           PY
+      - name: Build website data feed
+        run: python scripts/build_site_data.py
       - name: Build change table + summary
         run: python build_change_table.py
       - name: Update cost basis
